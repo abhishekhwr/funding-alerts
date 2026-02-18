@@ -1,1 +1,1 @@
-worker: python DD_Funding_Alerts
+worker: python DD_Funding_Alerts.py
