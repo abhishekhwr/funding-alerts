@@ -18,8 +18,9 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 SEEN_FILE = "/data/seen_entries.json"
 SENT_TODAY_FILE = "/data/sent_today.json"
 POLL_INTERVAL = 600
-MAX_AUTO_ALERTS = 5
-MAX_LATEST_ALERTS = 10
+MAX_AUTO_ALERTS = 3
+MAX_LATEST_ALERTS = 7
+ARCHIVE_FILE = "/data/article_archive.json"
 
 FEEDS = [
     "https://entrackr.com/feed/",
@@ -263,6 +264,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS):
     new_seen = []
     new_sent = []
     count = 0
+    archive = load_json(ARCHIVE_FILE)
 
     for feed_url in FEEDS:
         if count >= max_alerts:
@@ -273,6 +275,18 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS):
                 if count >= max_alerts:
                     break
                 entry_id = entry.get("id") or entry.get("link")
+                
+                # Archive every article regardless of relevance
+                archive_entry = {
+                    "id": entry_id,
+                    "title": entry.get("title", ""),
+                    "summary": entry.get("summary", ""),
+                    "url": entry.get("link", ""),
+                    "published": str(entry.get("published", ""))
+                }
+                if not any(a["id"] == entry_id for a in archive):
+                    archive.append(archive_entry)
+
                 if entry_id not in seen:
                     if is_relevant(entry) and is_recent(entry) and not is_duplicate(entry.title, sent_titles + new_sent):
                         real_url = resolve_url(entry.link)
@@ -283,8 +297,9 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS):
         except Exception as e:
             print(f"Feed error: {e}")
 
+    save_json(ARCHIVE_FILE, archive, limit=5000)
     return new_seen, new_sent
-
+    
 # --- Bot Commands ---
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -310,45 +325,41 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
     await update.message.reply_text(f"🔍 Searching for <b>{query}</b>...", parse_mode="HTML")
 
+    archive = load_json(ARCHIVE_FILE)
     results = []
-    for feed_url in FEEDS:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries:
-                text = entry.title + " " + entry.get("summary", "")
-                if fuzzy_match(query, text) and is_relevant(entry):
-                    days_old = 999
-                    try:
-                        pub = entry.get("published_parsed")
-                        if pub:
-                            pub_date = datetime(*pub[:6], tzinfo=timezone.utc)
-                            days_old = (datetime.now(timezone.utc) - pub_date).days
-                    except:
-                        pass
-                    results.append((days_old, entry))
-        except:
-            pass
 
-    results.sort(key=lambda x: x[0])
+    for article in archive:
+        text = article.get("title", "") + " " + article.get("summary", "")
+        if fuzzy_match(query, text):
+            results.append(article)
 
     if not results:
         await update.message.reply_text(f"No articles found for <b>{query}</b>.", parse_mode="HTML")
         return
 
-    recent = [r for r in results if r[0] <= 14]
-    if not recent:
-        oldest_days = results[0][0]
-        await update.message.reply_text(
-            f"No articles in the last 14 days. Showing results from up to {oldest_days} days ago."
-        )
-
     sent = []
-    for days_old, entry in results[:5]:
-        if not is_duplicate(entry.title, sent):
-            real_url = resolve_url(entry.link)
-            send_alert(entry, real_url)
-            sent.append(entry.title)
+    for article in results[:5]:
+        if not is_duplicate(article["title"], sent):
+            # Create a minimal entry-like object for send_alert
+            class FakeEntry:
+                def __init__(self, a):
+                    self.title = a["title"]
+                    self._summary = a.get("summary", "")
+                    self._link = a.get("url", "")
+                    self._published = a.get("published", "")
+                def get(self, key, default=""):
+                    if key == "summary": return self._summary
+                    if key == "link": return self._link
+                    if key == "published_parsed": return None
+                    return default
 
+            entry = FakeEntry(article)
+            real_url = resolve_url(article.get("url", ""))
+            send_alert(entry, real_url)
+            sent.append(article["title"])
+
+    if not sent:
+        await update.message.reply_text(f"No relevant funding articles found for <b>{query}</b>.", parse_mode="HTML")
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seen = load_json(SEEN_FILE)
     sent_today = load_json(SENT_TODAY_FILE)
