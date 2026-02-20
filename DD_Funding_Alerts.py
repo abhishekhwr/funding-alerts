@@ -11,8 +11,8 @@ from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-TELEGRAM_TOKEN = "***REVOKED_TELEGRAM_TOKEN***"
-CHAT_ID = "***REDACTED_CHAT_ID***"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT_ID = os.environ.get("CHAT_ID")
 SEEN_FILE = "/data/seen_entries.json"
 SENT_TODAY_FILE = "/data/sent_today.json"
 POLL_INTERVAL = 600
@@ -135,57 +135,43 @@ def fuzzy_match(query, text, threshold=0.6):
 
 # --- Entity Extraction ---
 
-def extract_entities(title, summary):
-    text = title + " " + clean_text(summary)
+import anthropic
 
-    # Amount
-    amount = ""
-    amount_match = re.search(
-        r'(\$[\d,.]+\s*(?:million|billion|mn|bn|M|B)|\₹[\d,.]+\s*(?:crore|lakh|cr)?|[\d,.]+\s*(?:crore|lakh|million|billion|cr|mn|bn))',
-        text, re.IGNORECASE
-    )
-    if amount_match:
-        amount = amount_match.group(0).strip()
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 
-    # Round type
-    round_type = ""
-    round_match = re.search(
-        r'(pre-seed|seed\s*round|series\s*[a-f][\+]?|bridge\s*round|venture\s*debt|debt\s*financing|ncd|debenture|ipo|pre-ipo|unicorn)',
-        text, re.IGNORECASE
-    )
-    if round_match:
-        round_type = round_match.group(0).strip().title()
+def extract_entities_llm(title, summary):
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    
+    prompt = f"""Extract structured information from this funding news article headline and summary.
 
-    # Investors — handle both "led by X" and "X-led"
-    investors = ""
-    investor_match = re.search(
-        r'(?:led by|backed by|from|investors include|participation from)\s+([A-Z][^,.]{3,60})',
-        text
-    )
-    if investor_match:
-        investors = investor_match.group(1).strip()
-    else:
-        # Handle "Blackstone-led" pattern
-        led_match = re.search(r'([A-Z][a-zA-Z\s]+?)-led', text)
-        if led_match:
-            investors = led_match.group(1).strip()
+Title: {title}
+Summary: {clean_text(summary)[:500]}
 
-    # Company name — expanded to catch more verb patterns
-    company = ""
-    company_match = re.search(
-        r'^(?:Gen AI startup|Startup|Fintech|Edtech|SaaS)?\s*([A-Z][a-zA-Z0-9\s]{1,25}?)\s+(?:raises|raised|secures|secured|gets|closes|acquires|turns unicorn|bags)',
-        title
-    )
-    if company_match:
-        company = company_match.group(1).strip()
+Return ONLY a JSON object with these fields:
+- company: company name only, no descriptors like "startup" or "fintech"
+- sector: primary sector (e.g. Fintech, SaaS, Edtech, Healthtech, D2C, Logistics, AI)
+- round: funding round (e.g. Seed, Series A, Series B, Debt, Acquisition)
+- amount: full amount with currency and unit (e.g. ₹4 Crore, $12 Million)
+- investors: lead investor(s), comma separated
+- deal_type: one of [funding, acquisition, debt, roundup, new_fund]
 
-    return {
-        "company": company,
-        "amount": amount,
-        "round": round_type,
-        "investors": investors
-    }
-def categorize(title, summary):
+If a field is not mentioned, return empty string. Return only valid JSON, no explanation."""
+
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = message.content[0].text.strip()
+        raw = re.sub(r'^```json|```$', '', raw).strip()
+        return json.loads(raw)
+    except Exception as e:
+        print(f"LLM extraction error: {e}")
+        return {
+            "company": "", "sector": "", "round": "",
+            "amount": "", "investors": "", "deal_type": "funding"
+        }def categorize(title, summary):
     text = (title + " " + summary).lower()
     # Check roundup first before acquisition
     if any(w in text for w in ["this week", "weekly", "roundup", "wrap", "digest", "funding recap", "ecosystem"]):
@@ -205,19 +191,20 @@ def format_message(entry, url):
     summary = entry.get("summary", "")
     source = get_source(url)
     age = time_ago(entry)
-    entities = extract_entities(title, clean_text(summary))
-    category = categorize(title, summary)
+    entities = extract_entities_llm(title, summary)
 
-    if category == "acquisition":
+    deal_type = entities.get("deal_type", "funding")
+
+    if deal_type == "acquisition":
         emoji = "🤝"
         label = "ACQUISITION ALERT"
-    elif category == "debt":
+    elif deal_type == "debt":
         emoji = "💳"
         label = "DEBT FINANCING"
-    elif category == "roundup":
+    elif deal_type == "roundup":
         emoji = "📊"
         label = "FUNDING DIGEST"
-    elif category == "new_fund":
+    elif deal_type == "new_fund":
         emoji = "🏦"
         label = "NEW FUND"
     else:
@@ -226,13 +213,15 @@ def format_message(entry, url):
 
     lines = [f"{emoji} <b>{label}</b>\n"]
 
-    if entities["company"]:
+    if entities.get("company"):
         lines.append(f"<b>Company:</b> {entities['company']}")
-    if entities["round"]:
+    if entities.get("sector"):
+        lines.append(f"<b>Sector:</b> {entities['sector']}")
+    if entities.get("round"):
         lines.append(f"<b>Round:</b> {entities['round']}")
-    if entities["amount"]:
+    if entities.get("amount"):
         lines.append(f"<b>Amount:</b> {entities['amount']}")
-    if entities["investors"]:
+    if entities.get("investors"):
         lines.append(f"<b>Investors:</b> {entities['investors']}")
 
     lines.append(f"\n<i>{title}</i>")
