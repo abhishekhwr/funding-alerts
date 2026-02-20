@@ -224,10 +224,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-
-Also update `requirements.txt` on GitHub to:
-```
-feedparser
-requests
-python-telegram-bot
