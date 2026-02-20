@@ -171,7 +171,9 @@ If a field is not mentioned, return empty string. Return only valid JSON, no exp
         return {
             "company": "", "sector": "", "round": "",
             "amount": "", "investors": "", "deal_type": "funding"
-        }def categorize(title, summary):
+        }
+
+def categorize(title, summary):
     text = (title + " " + summary).lower()
     # Check roundup first before acquisition
     if any(w in text for w in ["this week", "weekly", "roundup", "wrap", "digest", "funding recap", "ecosystem"]):
@@ -183,7 +185,6 @@ If a field is not mentioned, return empty string. Return only valid JSON, no exp
     if any(w in text for w in ["new fund", "fund launch", "announces fund", "raises fund"]):
         return "new_fund"
     return "funding"
-
 # --- Message Formatting ---
 
 def format_message(entry, url):
