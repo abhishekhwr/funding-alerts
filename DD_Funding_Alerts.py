@@ -17,10 +17,10 @@ CHAT_ID = os.environ.get("CHAT_ID")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 SEEN_FILE = "/data/seen_entries.json"
 SENT_TODAY_FILE = "/data/sent_today.json"
+ARCHIVE_FILE = "/data/article_archive.json"
 POLL_INTERVAL = 600
 MAX_AUTO_ALERTS = 3
 MAX_LATEST_ALERTS = 7
-ARCHIVE_FILE = "/data/article_archive.json"
 
 FEEDS = [
     "https://entrackr.com/feed/",
@@ -112,6 +112,12 @@ def is_recent(entry, days=14):
 
 def is_relevant(entry):
     text = (entry.get("title", "") + " " + entry.get("summary", "")).lower()
+    if any(ex in text for ex in EXCLUDE_KEYWORDS):
+        return False
+    return any(kw in text for kw in KEYWORDS)
+
+def is_relevant_text(text):
+    text = text.lower()
     if any(ex in text for ex in EXCLUDE_KEYWORDS):
         return False
     return any(kw in text for kw in KEYWORDS)
@@ -275,8 +281,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS):
                 if count >= max_alerts:
                     break
                 entry_id = entry.get("id") or entry.get("link")
-                
-                # Archive every article regardless of relevance
+
                 archive_entry = {
                     "id": entry_id,
                     "title": entry.get("title", ""),
@@ -299,7 +304,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS):
 
     save_json(ARCHIVE_FILE, archive, limit=5000)
     return new_seen, new_sent
-    
+
 # --- Bot Commands ---
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,13 +345,11 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sent = []
     for article in results[:5]:
         if not is_duplicate(article["title"], sent):
-            # Create a minimal entry-like object for send_alert
             class FakeEntry:
                 def __init__(self, a):
                     self.title = a["title"]
                     self._summary = a.get("summary", "")
                     self._link = a.get("url", "")
-                    self._published = a.get("published", "")
                 def get(self, key, default=""):
                     if key == "summary": return self._summary
                     if key == "link": return self._link
@@ -360,12 +363,52 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not sent:
         await update.message.reply_text(f"No relevant funding articles found for <b>{query}</b>.", parse_mode="HTML")
+
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Generating funding summary...")
+
+    archive = load_json(ARCHIVE_FILE)
+    candidates = [a for a in archive if is_relevant_text(a.get("title", "") + " " + a.get("summary", ""))][-20:]
+
+    if not candidates:
+        await update.message.reply_text("Not enough data yet. Check back after a few hours.")
+        return
+
+    titles = "\n".join([f"- {a['title']}" for a in candidates])
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+    prompt = f"""You are summarizing Indian startup funding news for a sales team.
+
+Here are the latest funding headlines:
+{titles}
+
+Write a concise digest in this format:
+- 2-3 sentence overview of overall funding activity
+- Bullet list of the most notable deals (company, amount, sector)
+- Any notable trends
+
+Keep it under 200 words. Be direct, no fluff."""
+
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        summary = message.content[0].text.strip()
+        await update.message.reply_text(f"📊 <b>Funding Digest</b>\n\n{summary}", parse_mode="HTML")
+    except Exception as e:
+        await update.message.reply_text("Summary generation failed. Try again.")
+        print(f"Summary error: {e}")
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seen = load_json(SEEN_FILE)
     sent_today = load_json(SENT_TODAY_FILE)
+    archive = load_json(ARCHIVE_FILE)
     await update.message.reply_text(
         f"✅ <b>Bot Status</b>\n\n"
         f"📊 Articles tracked: {len(seen)}\n"
+        f"🗄 Archive size: {len(archive)}\n"
         f"📬 Sent today: {len(sent_today)}\n"
         f"⏱ Check interval: every 10 minutes\n"
         f"📡 Feeds monitored: {len(FEEDS)}",
@@ -377,6 +420,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 <b>Available Commands</b>\n\n"
         "/latest — fetch up to 7 fresh funding alerts\n"
         "/search <i>name</i> — fuzzy search for a company\n"
+        "/summary — get a digest of recent funding activity\n"
         "/status — bot health and stats\n"
         "/help — this menu\n\n"
         "<i>Alerts are sent automatically every 10 minutes when new articles are detected.</i>",
@@ -412,6 +456,7 @@ def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
 
