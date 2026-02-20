@@ -415,12 +415,15 @@ def polling_loop():
         except Exception as e:
             print(f"Polling error: {e}")
         time.sleep(POLL_INTERVAL)
-
+async def cmd_getchatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
+    
 def main():
     print("Bot started...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("getchatid", cmd_getchatid))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
