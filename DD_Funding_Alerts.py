@@ -93,12 +93,22 @@ def is_recent(entry):
         return True
 
 def is_duplicate(title, seen_titles):
+    # Current word overlap check
     title_words = set(title.lower().split())
     for seen in seen_titles:
         seen_words = set(seen.lower().split())
         overlap = len(title_words & seen_words) / max(len(title_words), 1)
-        if overlap > 0.6:
+        if overlap > 0.5:  # lowered from 0.6 to catch more cross-source dupes
             return True
+    
+    # Also check if key nouns match (company names, amounts)
+    # Extract capitalised words as likely company names
+    key_terms = set(w for w in title.split() if w[0].isupper() and len(w) > 3)
+    for seen in seen_titles:
+        seen_terms = set(w for w in seen.split() if w[0].isupper() and len(w) > 3)
+        if len(key_terms & seen_terms) >= 2:  # 2+ matching proper nouns = same story
+            return True
+    
     return False
 
 def send_telegram(title, url, summary=""):
