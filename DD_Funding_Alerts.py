@@ -150,13 +150,13 @@ def extract_entities(title, summary):
     # Round type
     round_type = ""
     round_match = re.search(
-        r'(pre-seed|seed\s*round|series\s*[a-f][\+]?|bridge\s*round|venture\s*debt|debt\s*financing|ncd|debenture|ipo|pre-ipo)',
+        r'(pre-seed|seed\s*round|series\s*[a-f][\+]?|bridge\s*round|venture\s*debt|debt\s*financing|ncd|debenture|ipo|pre-ipo|unicorn)',
         text, re.IGNORECASE
     )
     if round_match:
         round_type = round_match.group(0).strip().title()
 
-    # Investors — look for "led by", "backed by", "from"
+    # Investors — handle both "led by X" and "X-led"
     investors = ""
     investor_match = re.search(
         r'(?:led by|backed by|from|investors include|participation from)\s+([A-Z][^,.]{3,60})',
@@ -164,11 +164,16 @@ def extract_entities(title, summary):
     )
     if investor_match:
         investors = investor_match.group(1).strip()
+    else:
+        # Handle "Blackstone-led" pattern
+        led_match = re.search(r'([A-Z][a-zA-Z\s]+?)-led', text)
+        if led_match:
+            investors = led_match.group(1).strip()
 
-    # Company name — first capitalized multi-word before "raises/raised/secures"
+    # Company name — expanded to catch more verb patterns
     company = ""
     company_match = re.search(
-        r'^([A-Z][a-zA-Z0-9\s]{1,30}?)\s+(?:raises|raised|secures|secured|gets|closes|acquires)',
+        r'^(?:Gen AI startup|Startup|Fintech|Edtech|SaaS)?\s*([A-Z][a-zA-Z0-9\s]{1,25}?)\s+(?:raises|raised|secures|secured|gets|closes|acquires|turns unicorn|bags)',
         title
     )
     if company_match:
@@ -180,16 +185,16 @@ def extract_entities(title, summary):
         "round": round_type,
         "investors": investors
     }
-
 def categorize(title, summary):
     text = (title + " " + summary).lower()
+    # Check roundup first before acquisition
+    if any(w in text for w in ["this week", "weekly", "roundup", "wrap", "digest", "funding recap", "ecosystem"]):
+        return "roundup"
     if any(w in text for w in ["acquires", "acquired", "acquisition", "merger", "stake purchase", "buys"]):
         return "acquisition"
     if any(w in text for w in ["debt", "ncd", "debenture", "venture debt", "credit facility", "term loan"]):
         return "debt"
-    if any(w in text for w in ["this week", "weekly", "roundup", "wrap", "digest", "funding recap"]):
-        return "roundup"
-    if any(w in text for w in ["new fund", "fund launch", "announces fund", "raises fund", "fund of"]):
+    if any(w in text for w in ["new fund", "fund launch", "announces fund", "raises fund"]):
         return "new_fund"
     return "funding"
 
