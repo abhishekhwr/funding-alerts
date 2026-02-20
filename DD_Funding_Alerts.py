@@ -386,8 +386,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data.startswith("search:"):
         company = query.data.split("search:")[1]
-        context.args = company.split()
-        await cmd_search(update, context)
+        await query.message.reply_text(f"🔍 Searching for <b>{company}</b>...", parse_mode="HTML")
+
+        results = []
+        for feed_url in FEEDS:
+            try:
+                feed = feedparser.parse(feed_url)
+                for entry in feed.entries:
+                    text = entry.title + " " + entry.get("summary", "")
+                    if fuzzy_match(company, text) and is_relevant(entry):
+                        days_old = 999
+                        try:
+                            pub = entry.get("published_parsed")
+                            if pub:
+                                pub_date = datetime(*pub[:6], tzinfo=timezone.utc)
+                                days_old = (datetime.now(timezone.utc) - pub_date).days
+                        except:
+                            pass
+                        results.append((days_old, entry))
+            except:
+                pass
+
+        results.sort(key=lambda x: x[0])
+
+        if not results:
+            await query.message.reply_text(f"No articles found for <b>{company}</b>.", parse_mode="HTML")
+            return
+
+        recent = [r for r in results if r[0] <= 14]
+        if not recent:
+            await query.message.reply_text(f"No articles in the last 14 days. Showing older results.")
+
+        sent = []
+        for days_old, entry in results[:5]:
+            if not is_duplicate(entry.title, sent):
+                real_url = resolve_url(entry.link)
+                send_alert(entry, real_url)
+                sent.append(entry.title)
+
     elif query.data == "not_relevant":
         await query.message.reply_text("Got it. This helps improve filtering over time.")
 
@@ -415,15 +451,12 @@ def polling_loop():
         except Exception as e:
             print(f"Polling error: {e}")
         time.sleep(POLL_INTERVAL)
-async def cmd_getchatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
     
 def main():
     print("Bot started...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("search", cmd_search))
-    app.add_handler(CommandHandler("getchatid", cmd_getchatid))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_callback))
