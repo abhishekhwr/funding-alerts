@@ -158,13 +158,29 @@ def fetch_and_alert(seen, max_alerts=MAX_ALERTS_PER_RUN):
 # --- Interactive Bot Commands ---
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send latest funding articles on demand"""
     await update.message.reply_text("Fetching latest funding news...")
-    seen = load_seen()
-    # Temporarily lower the cap for on-demand fetch
-    new_entries = fetch_and_alert(seen, max_alerts=5)
-    seen = list(set(seen + new_entries))
-    save_seen(seen)
+    
+    sent_titles = []
+    count = 0
+    
+    for feed_url in FEEDS:
+        if count >= 5:
+            break
+        try:
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:3]:  # just top 3 from each feed
+                if count >= 5:
+                    break
+                if is_relevant(entry) and not is_duplicate(entry.title, sent_titles):
+                    real_url = resolve_url(entry.link)
+                    send_telegram(entry.title, real_url, entry.get("summary", ""))
+                    sent_titles.append(entry.title)
+                    count += 1
+        except:
+            pass
+    
+    if count == 0:
+        await update.message.reply_text("No relevant funding news found right now.")
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Search for a specific company across feeds"""
