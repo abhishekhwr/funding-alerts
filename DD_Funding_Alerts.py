@@ -10,14 +10,16 @@ import threading
 from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import anthropic
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 SEEN_FILE = "/data/seen_entries.json"
 SENT_TODAY_FILE = "/data/sent_today.json"
 POLL_INTERVAL = 600
-MAX_AUTO_ALERTS = 3
-MAX_LATEST_ALERTS = 7
+MAX_AUTO_ALERTS = 5
+MAX_LATEST_ALERTS = 10
 
 FEEDS = [
     "https://entrackr.com/feed/",
@@ -42,7 +44,7 @@ KEYWORDS = [
 EXCLUDE_KEYWORDS = [
     "upsc", "exam", "syllabus", "ias", "government scheme",
     "budget allocation", "policy", "startup india fund",
-    "fund of funds" 
+    "fund of funds"
 ]
 
 # --- Utility ---
@@ -86,10 +88,11 @@ def time_ago(entry):
             return "Recently"
         pub_date = datetime(*published[:6], tzinfo=timezone.utc)
         diff = datetime.now(timezone.utc) - pub_date
-        if diff.seconds < 3600:
-            return f"{diff.seconds // 60}m ago"
-        elif diff.days == 0:
-            return f"{diff.seconds // 3600}h ago"
+        if diff.days == 0:
+            if diff.seconds < 3600:
+                return f"{diff.seconds // 60}m ago"
+            else:
+                return f"{diff.seconds // 3600}h ago"
         else:
             return f"{diff.days}d ago"
     except:
@@ -135,13 +138,9 @@ def fuzzy_match(query, text, threshold=0.6):
 
 # --- Entity Extraction ---
 
-import anthropic
-
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
-
 def extract_entities_llm(title, summary):
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-    
+
     prompt = f"""Extract structured information from this funding news article headline and summary.
 
 Title: {title}
@@ -175,7 +174,6 @@ If a field is not mentioned, return empty string. Return only valid JSON, no exp
 
 def categorize(title, summary):
     text = (title + " " + summary).lower()
-    # Check roundup first before acquisition
     if any(w in text for w in ["this week", "weekly", "roundup", "wrap", "digest", "funding recap", "ecosystem"]):
         return "roundup"
     if any(w in text for w in ["acquires", "acquired", "acquisition", "merger", "stake purchase", "buys"]):
@@ -185,6 +183,7 @@ def categorize(title, summary):
     if any(w in text for w in ["new fund", "fund launch", "announces fund", "raises fund"]):
         return "new_fund"
     return "funding"
+
 # --- Message Formatting ---
 
 def format_message(entry, url):
@@ -233,16 +232,11 @@ def format_message(entry, url):
 def send_alert(entry, url):
     message, url, company = format_message(entry, url)
 
-    keyboard = [[
-        InlineKeyboardButton("📄 Read Article", url=url),
-    ]]
+    keyboard = [[InlineKeyboardButton("📄 Read Article", url=url)]]
     if company:
         keyboard.append([
-            InlineKeyboardButton(f"🔍 Search {company}", callback_data=f"search:{company}"),
+            InlineKeyboardButton(f"🔍 Search {company}", url=f"https://www.google.com/search?q={company}+funding+India"),
         ])
-    keyboard.append([
-        InlineKeyboardButton("❌ Not Relevant", callback_data="not_relevant")
-    ])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -335,14 +329,12 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-    # Sort by recency
     results.sort(key=lambda x: x[0])
 
     if not results:
         await update.message.reply_text(f"No articles found for <b>{query}</b>.", parse_mode="HTML")
         return
 
-    # Check if all results are older than 14 days
     recent = [r for r in results if r[0] <= 14]
     if not recent:
         oldest_days = results[0][0]
@@ -380,53 +372,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML"
     )
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.data.startswith("search:"):
-        company = query.data.split("search:")[1]
-        await query.message.reply_text(f"🔍 Searching for <b>{company}</b>...", parse_mode="HTML")
-
-        results = []
-        for feed_url in FEEDS:
-            try:
-                feed = feedparser.parse(feed_url)
-                for entry in feed.entries:
-                    text = entry.title + " " + entry.get("summary", "")
-                    if fuzzy_match(company, text) and is_relevant(entry):
-                        days_old = 999
-                        try:
-                            pub = entry.get("published_parsed")
-                            if pub:
-                                pub_date = datetime(*pub[:6], tzinfo=timezone.utc)
-                                days_old = (datetime.now(timezone.utc) - pub_date).days
-                        except:
-                            pass
-                        results.append((days_old, entry))
-            except:
-                pass
-
-        results.sort(key=lambda x: x[0])
-
-        if not results:
-            await query.message.reply_text(f"No articles found for <b>{company}</b>.", parse_mode="HTML")
-            return
-
-        recent = [r for r in results if r[0] <= 14]
-        if not recent:
-            await query.message.reply_text(f"No articles in the last 14 days. Showing older results.")
-
-        sent = []
-        for days_old, entry in results[:5]:
-            if not is_duplicate(entry.title, sent):
-                real_url = resolve_url(entry.link)
-                send_alert(entry, real_url)
-                sent.append(entry.title)
-
-    elif query.data == "not_relevant":
-        await query.message.reply_text("Got it. This helps improve filtering over time.")
-
 # --- Main ---
 
 def polling_loop():
@@ -436,7 +381,6 @@ def polling_loop():
 
     while True:
         try:
-            # Reset sent_today at midnight
             today = datetime.now().date()
             if today != last_reset:
                 sent_today = []
@@ -451,7 +395,7 @@ def polling_loop():
         except Exception as e:
             print(f"Polling error: {e}")
         time.sleep(POLL_INTERVAL)
-    
+
 def main():
     print("Bot started...")
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
@@ -459,7 +403,6 @@ def main():
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CallbackQueryHandler(handle_callback))
 
     t = threading.Thread(target=polling_loop, daemon=True)
     t.start()
