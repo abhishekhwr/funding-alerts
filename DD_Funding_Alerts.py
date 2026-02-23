@@ -366,13 +366,22 @@ def llm_is_relevant(title, summary):
     """Second-pass LLM filter: reject false positives that keyword filter let through."""
     text = f"Title: {title}\nSummary: {clean_text(summary)[:300]}"
 
-    answer = llm_call(f"""Is this article about a specific company or startup involved in one of these events?
-- Raising funding (seed, Series A/B/C/D, etc.)
-- Being acquired or merging with another company
-- Taking on debt financing or venture debt
-- A funding roundup/weekly digest covering multiple deals
+    answer = llm_call(f"""Is this article about a STARTUP or PRIVATE COMPANY involved in one of these events?
+- Raising venture funding (seed, Series A/B/C/D, pre-seed, etc.)
+- A startup being acquired or merging
+- A startup taking on venture debt or debt financing
+- A funding roundup/weekly digest covering multiple startup deals
 
-It is NOT relevant if it's about: stock market moves, quarterly earnings, government policy, events/conferences, infrastructure projects, capex plans, general business updates, IPOs, or revenue/profit reports.
+Answer "no" if:
+- It's about a LARGE PUBLIC/LISTED company (like Marico, Tata, Reliance, Infosys, Adani, etc.) doing M&A, acquisitions, or corporate investments
+- Stock market moves, quarterly earnings, revenue/profit reports
+- Government policy, budgets, regulatory announcements
+- Events, conferences, summits, awards
+- Infrastructure projects, capex plans
+- IPOs or public market activity
+- General business news not about a specific funding round
+
+The focus is on INDIAN STARTUP ECOSYSTEM funding — private companies raising venture capital.
 
 {text}
 
@@ -494,8 +503,8 @@ def has_minimum_fields(entities):
         return True
     return has_company and has_detail
 
-def send_alert(title, summary, url, published_parsed=None):
-    """Send a formatted alert to Telegram. Returns (success, company_name)."""
+def prepare_alert(title, summary, url, published_parsed=None):
+    """Prepare an alert message without sending. Returns (message, url, company, entities) or None if low quality."""
     message, url, company, entities = format_message(title, summary, url, published_parsed)
 
     # Minimum field threshold — skip low-quality alerts
@@ -503,8 +512,11 @@ def send_alert(title, summary, url, published_parsed=None):
         confidence = entities.get("confidence", "low")
         if confidence == "low":
             print(f"Skipped low-quality alert: {title[:80]}")
-            return False, ""
+            return None
+    return message, url, company, entities
 
+def send_prepared_alert(message, url, company):
+    """Send a pre-formatted alert to Telegram. Returns (success, company_name)."""
     keyboard = [[InlineKeyboardButton("📄 Read Article", url=url)]]
     if company:
         search_url = f"https://www.google.com/search?q={quote_plus(company)}+funding+India"
@@ -535,6 +547,14 @@ def send_alert(title, summary, url, published_parsed=None):
         print(f"Send alert error: {e}")
         return False, ""
 
+def send_alert(title, summary, url, published_parsed=None):
+    """Convenience wrapper: prepare + send in one call. Returns (success, company_name)."""
+    prepared = prepare_alert(title, summary, url, published_parsed)
+    if prepared is None:
+        return False, ""
+    message, url, company, entities = prepared
+    return send_prepared_alert(message, url, company)
+
 def send_text(text):
     try:
         requests.post(
@@ -550,6 +570,7 @@ def send_text(text):
 def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter=None):
     new_seen = []
     new_sent = []
+    sent_companies = set()  # Track company names to prevent cross-feed duplicates
     count = 0
     llm_checks = 0
     MAX_LLM_CHECKS_PER_CYCLE = 15  # Cap LLM calls to control latency
@@ -607,14 +628,31 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                     real_url = resolve_url(entry.get("link", ""))
                     published_parsed = entry.published_parsed[:6] if hasattr(entry, 'published_parsed') and entry.published_parsed else None
 
-                    success, _ = send_alert(
+                    # Prepare alert (runs LLM extraction) BEFORE sending
+                    prepared = prepare_alert(
                         entry.get("title", ""),
                         entry.get("summary", ""),
                         real_url,
                         published_parsed
                     )
+                    if prepared is None:
+                        continue
+
+                    message, final_url, company, entities = prepared
+
+                    # Company-level dedup: skip if same company already alerted this cycle
+                    if company:
+                        company_lower = company.lower().strip()
+                        if company_lower in sent_companies:
+                            print(f"Skipped cross-feed duplicate: {company} - {entry.get('title', '')[:60]}")
+                            continue
+
+                    # Now send
+                    success, _ = send_prepared_alert(message, final_url, company)
                     if success:
                         new_sent.append(entry.get("title", ""))
+                        if company:
+                            sent_companies.add(company.lower().strip())
                         count += 1
                     # If send failed, don't add to sent — will retry next cycle
         except Exception as e:
