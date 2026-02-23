@@ -152,6 +152,23 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+def markdown_to_telegram_html(text):
+    """Convert common Markdown formatting to Telegram-safe HTML."""
+    # Remove markdown headers (## Header → bold)
+    text = re.sub(r'^#{1,4}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    # Bold: **text** or __text__ → <b>text</b>
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    # Italic: *text* or _text_ → <i>text</i>  (but not inside URLs or already-converted tags)
+    text = re.sub(r'(?<![<\w])\*([^*\n]+?)\*(?![>\w])', r'<i>\1</i>', text)
+    # Markdown horizontal rules → empty line
+    text = re.sub(r'^---+$', '', text, flags=re.MULTILINE)
+    # Markdown links [text](url) → just text
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # Clean up excessive blank lines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 def clean_google_news_title(title):
     """Strip trailing '- Source Name' from Google News titles."""
     return re.sub(r'\s*[-–—]\s*[A-Z][A-Za-z0-9\s\.&,]+$', '', title).strip()
@@ -267,18 +284,32 @@ def fuzzy_match(query, text, threshold=0.6):
     ratio = SequenceMatcher(None, query, text).ratio()
     return ratio >= threshold
 
+# --- LLM Helpers ---
+
+def llm_call(prompt, max_tokens=300, retries=2):
+    """Make an LLM call with retry logic for transient failures."""
+    client = get_llm_client()
+    for attempt in range(retries + 1):
+        try:
+            message = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            return message.content[0].text.strip()
+        except Exception as e:
+            print(f"LLM call error (attempt {attempt + 1}/{retries + 1}): {e}")
+            if attempt < retries:
+                time.sleep(2)
+    return None
+
 # --- LLM: Relevance Validation ---
 
 def llm_is_relevant(title, summary):
     """Second-pass LLM filter: reject false positives that keyword filter let through."""
-    client = get_llm_client()
     text = f"Title: {title}\nSummary: {clean_text(summary)[:300]}"
 
-    try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=50,
-            messages=[{"role": "user", "content": f"""Is this article about a specific company or startup involved in one of these events?
+    answer = llm_call(f"""Is this article about a specific company or startup involved in one of these events?
 - Raising funding (seed, Series A/B/C/D, etc.)
 - Being acquired or merging with another company
 - Taking on debt financing or venture debt
@@ -288,19 +319,15 @@ It is NOT relevant if it's about: stock market moves, quarterly earnings, govern
 
 {text}
 
-Answer ONLY "yes" or "no"."""}]
-        )
-        answer = message.content[0].text.strip().lower()
-        return answer.startswith("yes")
-    except Exception as e:
-        print(f"LLM relevance check error: {e}")
+Answer ONLY "yes" or "no".""", max_tokens=10, retries=1)
+
+    if answer is None:
         return True  # Default to relevant on failure
+    return answer.lower().startswith("yes")
 
 # --- LLM: Entity Extraction ---
 
 def extract_entities_llm(title, summary):
-    client = get_llm_client()
-
     prompt = f"""Extract structured information from this startup/funding news article.
 
 Title: {title}
@@ -324,28 +351,25 @@ IMPORTANT distinctions:
 
 If a field is not mentioned, return empty string. Return only valid JSON."""
 
+    raw = llm_call(prompt, max_tokens=350, retries=2)
+    default = {
+        "company": "", "sector": "", "round": "",
+        "amount": "", "investors": "", "deal_type": "funding",
+        "confidence": "low"
+    }
+    if raw is None:
+        return default
     try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=350,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        raw = message.content[0].text.strip()
         raw = re.sub(r'^```json\s*', '', raw)
         raw = re.sub(r'\s*```$', '', raw)
         result = json.loads(raw)
-        # Ensure all expected fields exist
         for field in ["company", "sector", "round", "amount", "investors", "deal_type", "confidence"]:
             if field not in result:
                 result[field] = "" if field != "deal_type" else "funding"
         return result
     except Exception as e:
-        print(f"LLM extraction error: {e}")
-        return {
-            "company": "", "sector": "", "round": "",
-            "amount": "", "investors": "", "deal_type": "funding",
-            "confidence": "low"
-        }
+        print(f"LLM extraction parse error: {e}")
+        return default
 
 # --- Message Formatting ---
 
@@ -470,6 +494,8 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
     new_seen = []
     new_sent = []
     count = 0
+    llm_checks = 0
+    MAX_LLM_CHECKS_PER_CYCLE = 15  # Cap LLM calls to control latency
 
     archive = load_json(ARCHIVE_FILE)
     archive_ids = set(a.get("id") for a in archive)  # O(1) lookups
@@ -480,7 +506,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
             break
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries:
+            for entry in feed.entries[:15]:  # Cap entries per feed to avoid slow feeds
                 if count >= max_alerts:
                     break
                 entry_id = entry.get("id") or entry.get("link")
@@ -500,6 +526,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                 if entry_id not in seen_set:
                     new_seen.append(entry_id)
 
+                    # Fast keyword filters first (no LLM cost)
                     if not is_relevant(entry):
                         continue
                     if not is_recent(entry):
@@ -507,10 +534,12 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                     if is_duplicate(entry.get("title", ""), sent_titles + new_sent):
                         continue
 
-                    # LLM second-pass relevance check
-                    if not llm_is_relevant(entry.get("title", ""), entry.get("summary", "")):
-                        print(f"LLM rejected: {entry.get('title', '')[:80]}")
-                        continue
+                    # LLM second-pass relevance check (capped per cycle)
+                    if llm_checks < MAX_LLM_CHECKS_PER_CYCLE:
+                        llm_checks += 1
+                        if not llm_is_relevant(entry.get("title", ""), entry.get("summary", "")):
+                            print(f"LLM rejected: {entry.get('title', '')[:80]}")
+                            continue
 
                     # Sector filter
                     if sector_filter:
@@ -614,7 +643,6 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for a in candidates
     ])
 
-    client = get_llm_client()
     prompt = f"""You are summarizing Indian startup funding news for a sales team focused on tech companies.
 
 Here are the latest funding articles:
@@ -622,27 +650,27 @@ Here are the latest funding articles:
 
 Write a concise digest in this format:
 1. 2-3 sentence overview of overall funding activity and market sentiment
-2. Bullet list of the most notable deals (company, amount, sector, round)
+2. Bullet list of the most notable deals (company, amount, sector, round) using • as bullet character
 3. Any notable trends (hot sectors, large rounds, active investors)
 
-Keep it under 250 words. Be direct, no fluff. Use ₹ for Indian amounts."""
+IMPORTANT formatting rules:
+- Use ONLY plain text. No markdown. No headers with #. No **bold** syntax.
+- Use • for bullet points
+- Use ₹ for Indian amounts
+- Keep it under 250 words. Be direct, no fluff."""
 
-    try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=500,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        summary = message.content[0].text.strip()
+    summary = llm_call(prompt, max_tokens=500, retries=2)
+    if summary:
+        summary = markdown_to_telegram_html(summary)
         await update.message.reply_text(f"📊 <b>Funding Digest</b>\n\n{summary}", parse_mode="HTML")
-    except Exception as e:
+    else:
         await update.message.reply_text("Summary generation failed. Try again shortly.")
-        print(f"Summary error: {e}")
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📅 Fetching today's funding activity...")
 
     archive = load_json(ARCHIVE_FILE)
+    sent_today = load_json(SENT_TODAY_FILE)
     today = datetime.now(timezone.utc).date()
     today_articles = []
 
@@ -662,22 +690,30 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No funding activity detected today yet. Auto-alerts run every 10 minutes.")
         return
 
+    # Skip articles already sent today
     sent = []
-    for article in relevant[:7]:
-        if not is_duplicate(article.get("title", ""), sent):
-            real_url = resolve_url(article.get("url", ""))
-            pp = article.get("published_parsed")
-            success, _ = send_alert(
-                article.get("title", ""),
-                article.get("summary", ""),
-                real_url,
-                tuple(pp) if pp else None
-            )
-            if success:
-                sent.append(article.get("title", ""))
+    skipped = 0
+    for article in relevant[:10]:
+        title = article.get("title", "")
+        if is_duplicate(title, sent_today + sent):
+            skipped += 1
+            continue
+        real_url = resolve_url(article.get("url", ""))
+        pp = article.get("published_parsed")
+        success, _ = send_alert(
+            title,
+            article.get("summary", ""),
+            real_url,
+            tuple(pp) if pp else None
+        )
+        if success:
+            sent.append(title)
+        if len(sent) >= 7:
+            break
 
     if not sent:
-        await update.message.reply_text("No relevant funding deals found today.")
+        msg = "All of today's funding alerts have already been sent." if skipped > 0 else "No relevant funding deals found today."
+        await update.message.reply_text(msg)
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📅 Generating this week's funding summary...")
@@ -707,7 +743,6 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for a in relevant[-25:]
     ])
 
-    client = get_llm_client()
     prompt = f"""Summarize this week's Indian startup funding activity for a sales team.
 
 Articles from the past 7 days:
@@ -715,28 +750,27 @@ Articles from the past 7 days:
 
 Write a weekly digest:
 1. Overall funding landscape this week (2-3 sentences)
-2. Top deals of the week (company, amount, sector, round) — bullet list
+2. Top deals of the week (company, amount, sector, round) — use • for bullet points
 3. Most active sectors and investors
 4. Key takeaway for the sales team
 
-Keep it under 300 words. Be specific with numbers. Use ₹ for Indian amounts."""
+IMPORTANT formatting rules:
+- Use ONLY plain text. No markdown. No headers with #. No **bold** syntax. No --- dividers.
+- Use • for bullet points
+- Use ₹ for Indian amounts
+- Keep it under 300 words. Be specific with numbers."""
 
-    try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=600,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        summary = message.content[0].text.strip()
+    summary = llm_call(prompt, max_tokens=600, retries=2)
+    if summary:
+        summary = markdown_to_telegram_html(summary)
         await update.message.reply_text(
             f"📅 <b>Weekly Funding Digest</b>\n"
             f"<i>{cutoff.strftime('%b %d')} — {datetime.now(timezone.utc).strftime('%b %d, %Y')}</i>\n\n"
             f"{summary}",
             parse_mode="HTML"
         )
-    except Exception as e:
+    else:
         await update.message.reply_text("Weekly summary generation failed. Try again.")
-        print(f"Weekly summary error: {e}")
 
 async def cmd_sector(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -929,3 +963,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
