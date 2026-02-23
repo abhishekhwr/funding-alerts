@@ -43,16 +43,12 @@ FEEDS = [
     "https://economictimes.indiatimes.com/small-biz/startups/rss.cms",
     "https://www.livemint.com/rss/startup",
     "https://www.business-standard.com/rss/startups-10304.rss",
-    "https://www.moneycontrol.com/rss/business/startups.xml",
-    "https://www.thehindubusinessline.com/companies/?service=rss",
 
-    # Google News — funding rounds
+    # Google News
     "https://news.google.com/rss/search?q=india+startup+funding+raised&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+series+a+series+b+raised&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+startup+seed+funding+2026&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+startup+pre-seed+raised&hl=en-IN&gl=IN&ceid=IN:en",
-
-    # Google News — deal types
     "https://news.google.com/rss/search?q=india+startup+acquisition+merger&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+startup+debt+financing&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+unicorn+funding+raised&hl=en-IN&gl=IN&ceid=IN:en",
@@ -68,10 +64,13 @@ KEYWORDS = [
 ]
 EXCLUDE_KEYWORDS = [
     "upsc", "exam", "syllabus", "ias", "government scheme",
-    "budget allocation", "policy", "startup india fund",
-    "fund of funds"
+    "budget allocation", "policy", "startup india fund", "fund of funds",
+    "order book", "capex", "design flaw", "loss", "cag report",
+    "gig levy", "gig worker", "listed company", "ipo", "q3 results",
+    "quarterly results", "net profit", "revenue growth", "spends over",
+    "to spend", "to invest over", "by 2028", "by 2030",
+    "climate finance", "global energy", "european", "french",
 ]
-
 # --- Utility ---
 
 def load_json(path):
