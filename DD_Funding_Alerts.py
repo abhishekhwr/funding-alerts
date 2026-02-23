@@ -23,26 +23,49 @@ MAX_AUTO_ALERTS = 3
 MAX_LATEST_ALERTS = 7
 
 FEEDS = [
+    # Entrackr
     "https://entrackr.com/feed/",
+    "https://entrackr.com/snippets/feed/",
+    "https://entrackr.com/exclusive/feed/",
+
+    # Inc42
     "https://inc42.com/feed/",
+    "https://inc42.com/buzz/feed/",
+    "https://inc42.com/features/feed/",
+
+    # YourStory
     "https://yourstory.com/feed",
+
+    # VCCircle
     "https://www.vccircle.com/feed",
+
+    # Business press
     "https://economictimes.indiatimes.com/small-biz/startups/rss.cms",
     "https://www.livemint.com/rss/startup",
+    "https://www.business-standard.com/rss/startups-10304.rss",
+    "https://www.moneycontrol.com/rss/business/startups.xml",
+    "https://www.thehindubusinessline.com/companies/?service=rss",
+
+    # Google News — funding rounds
     "https://news.google.com/rss/search?q=india+startup+funding+raised&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+series+a+series+b+raised&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=india+startup+seed+funding+2026&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=india+startup+pre-seed+raised&hl=en-IN&gl=IN&ceid=IN:en",
+
+    # Google News — deal types
     "https://news.google.com/rss/search?q=india+startup+acquisition+merger&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+startup+debt+financing&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=india+unicorn+funding+raised&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=india+startup+closes+round+2026&hl=en-IN&gl=IN&ceid=IN:en",
 ]
-
 KEYWORDS = [
     "funding", "raises", "raised", "series a", "series b", "series c",
-    "seed round", "pre-seed", "investment", "crore", "million",
+    "series d", "series e", "seed round", "pre-seed", "pre-series",
+    "investment", "crore", "million", " mn", " cr ",
     "acquisition", "acquires", "acquired", "merger", "stake",
     "debt financing", "venture debt", "ncd", "debenture",
-    " mn", " cr ", "series d", "series e", "pre-series"
+    "closes round", "funding round", "leads round"
 ]
-
 EXCLUDE_KEYWORDS = [
     "upsc", "exam", "syllabus", "ias", "government scheme",
     "budget allocation", "policy", "startup india fund",
