@@ -5,12 +5,13 @@ import json
 import os
 import re
 import sys
+import hashlib
 from urllib.parse import urlparse, quote_plus
 from datetime import datetime, timezone, timedelta
 import threading
 from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 import anthropic
 
 # --- Configuration ---
@@ -24,6 +25,8 @@ SENT_TODAY_FILE = "/data/sent_today.json"
 ARCHIVE_FILE = "/data/article_archive.json"
 SETTINGS_FILE = "/data/bot_settings.json"
 FEEDBACK_FILE = "/data/feedback_log.json"
+REJECTIONS_FILE = "/data/rejections.json"
+MAX_REJECTION_EXAMPLES = 15  # Max examples to inject into LLM prompt
 
 POLL_INTERVAL = 600
 MAX_AUTO_ALERTS = 3
@@ -32,6 +35,9 @@ IST = timezone(timedelta(hours=5, minutes=30))
 
 # Thread lock for shared state
 state_lock = threading.Lock()
+
+# In-memory mapping of alert hash → (title, summary) for callback lookups
+alert_hash_map = {}
 
 # Singleton Anthropic client
 llm_client = None
@@ -145,6 +151,38 @@ def save_settings(settings):
             json.dump(settings, f)
     except Exception as e:
         print(f"Error saving settings: {e}")
+
+def load_rejections():
+    """Load rejection log as a list of dicts."""
+    data = load_json(REJECTIONS_FILE)
+    return data if isinstance(data, list) else []
+
+def save_rejection(title, summary):
+    """Log a rejected alert as a negative example for future LLM prompts."""
+    rejections = load_rejections()
+    rejections.append({
+        "title": clean_text(title)[:150],
+        "summary": clean_text(summary)[:200],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    save_json(REJECTIONS_FILE, rejections, limit=100)
+
+def get_rejection_examples():
+    """Build a prompt fragment with recent rejection examples for few-shot learning."""
+    rejections = load_rejections()
+    if not rejections:
+        return ""
+    recent = rejections[-MAX_REJECTION_EXAMPLES:]
+    examples = "\n".join([
+        f"- Title: {r['title']}" for r in recent
+    ])
+    return f"""
+
+IMPORTANT: Users have previously marked the following articles as NOT RELEVANT (false positives).
+Learn from these patterns — articles similar to these should be rejected:
+{examples}
+
+Use these examples to understand what types of articles are false positives, but do NOT block any specific company or sector permanently. The same company could have a relevant funding article in the future."""
 
 def parse_published_string(pub_str):
     """Parse a published date string into a list [year, month, day, hour, min, sec] or None."""
@@ -363,8 +401,10 @@ def llm_call(prompt, max_tokens=300, retries=2):
 # --- LLM: Relevance Validation ---
 
 def llm_is_relevant(title, summary):
-    """Second-pass LLM filter: reject false positives that keyword filter let through."""
+    """Second-pass LLM filter: reject false positives that keyword filter let through.
+    Includes few-shot negative examples from user rejections for continuous learning."""
     text = f"Title: {title}\nSummary: {clean_text(summary)[:300]}"
+    rejection_examples = get_rejection_examples()
 
     answer = llm_call(f"""Is this article about a STARTUP or PRIVATE COMPANY involved in one of these events?
 - Raising venture funding (seed, Series A/B/C/D, pre-seed, etc.)
@@ -382,7 +422,7 @@ Answer "no" if:
 - General business news not about a specific funding round
 
 The focus is on INDIAN STARTUP ECOSYSTEM funding — private companies raising venture capital.
-
+{rejection_examples}
 {text}
 
 Answer ONLY "yes" or "no".""", max_tokens=10, retries=1)
@@ -515,14 +555,25 @@ def prepare_alert(title, summary, url, published_parsed=None):
             return None
     return message, url, company, entities
 
-def send_prepared_alert(message, url, company):
+def send_prepared_alert(message, url, company, title="", summary=""):
     """Send a pre-formatted alert to Telegram. Returns (success, company_name)."""
+    alert_hash = hashlib.md5(title.encode()).hexdigest()[:12]
+
+    # Register in hash map for callback lookup
+    alert_hash_map[alert_hash] = {"title": title, "summary": summary}
+    # Keep map bounded
+    if len(alert_hash_map) > 200:
+        oldest_keys = list(alert_hash_map.keys())[:-200]
+        for k in oldest_keys:
+            del alert_hash_map[k]
+
     keyboard = [[InlineKeyboardButton("📄 Read Article", url=url)]]
+    row2 = []
     if company:
         search_url = f"https://www.google.com/search?q={quote_plus(company)}+funding+India"
-        keyboard.append([
-            InlineKeyboardButton(f"🔍 Search {company}", url=search_url),
-        ])
+        row2.append(InlineKeyboardButton(f"🔍 Search {company}", url=search_url))
+    row2.append(InlineKeyboardButton("👎 Not Relevant", callback_data=f"reject:{alert_hash}"))
+    keyboard.append(row2)
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -553,7 +604,7 @@ def send_alert(title, summary, url, published_parsed=None):
     if prepared is None:
         return False, ""
     message, url, company, entities = prepared
-    return send_prepared_alert(message, url, company)
+    return send_prepared_alert(message, url, company, title=title, summary=summary)
 
 def send_text(text):
     try:
@@ -648,7 +699,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                             continue
 
                     # Now send
-                    success, _ = send_prepared_alert(message, final_url, company)
+                    success, _ = send_prepared_alert(message, final_url, company, title=entry.get("title", ""), summary=entry.get("summary", ""))
                     if success:
                         new_sent.append(entry.get("title", ""))
                         if company:
@@ -930,6 +981,62 @@ async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_json(FEEDBACK_FILE, feedback_log, limit=500)
     await update.message.reply_text("✅ Feedback logged. Thanks for helping improve the bot!")
 
+async def handle_rejection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 👎 Not Relevant button press."""
+    query = update.callback_query
+    await query.answer()  # Acknowledge the button press
+
+    data = query.data
+    if not data or not data.startswith("reject:"):
+        return
+
+    alert_hash = data.split(":", 1)[1]
+
+    # Look up the article from hash map
+    article_data = alert_hash_map.get(alert_hash)
+    if article_data:
+        save_rejection(article_data["title"], article_data["summary"])
+        rejections = load_rejections()
+        await query.edit_message_reply_markup(reply_markup=None)  # Remove buttons
+        await query.message.reply_text(
+            f"👎 Marked as not relevant. Bot is learning from your feedback.\n"
+            f"<i>({len(rejections)} rejection examples stored)</i>",
+            parse_mode="HTML"
+        )
+    else:
+        # Hash not in memory (bot might have restarted) — try extracting title from the message text
+        msg_text = query.message.text or ""
+        save_rejection(msg_text[:150], "")
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            "👎 Marked as not relevant. Feedback recorded.",
+            parse_mode="HTML"
+        )
+
+async def cmd_rejections(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View recent rejections and learning status."""
+    rejections = load_rejections()
+
+    if not rejections:
+        await update.message.reply_text(
+            "📝 <b>No rejections yet</b>\n\n"
+            "Tap the 👎 button on any alert to mark it as not relevant. "
+            "The bot will learn from your feedback and improve over time.",
+            parse_mode="HTML"
+        )
+        return
+
+    recent = rejections[-10:]
+    lines = [f"📝 <b>Recent Rejections</b> ({len(rejections)} total)\n"]
+    for r in reversed(recent):
+        title = r.get("title", "Unknown")[:80]
+        lines.append(f"• {title}")
+
+    lines.append(f"\n<i>These examples are used as few-shot negatives in the LLM relevance filter. "
+                  f"The bot learns the pattern of misclassification, not specific companies or sectors.</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reset all data files to start fresh. Requires confirmation."""
     if not context.args or context.args[0].lower() != "confirm":
@@ -967,6 +1074,7 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     seen = load_json(SEEN_FILE)
     archive = load_json(ARCHIVE_FILE)
     sent_today = load_json(SENT_TODAY_FILE)
+    rejections = load_rejections()
 
     mute_status = "🔇 Muted" if settings.get("muted") else "🔊 Active"
     sector = settings.get("sector_filter") or "All sectors"
@@ -982,7 +1090,8 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 <b>Stats</b>\n"
         f"Articles tracked: {len(seen)}\n"
         f"Archive size: {len(archive)}\n"
-        f"Sent today: {len(sent_today)}",
+        f"Sent today: {len(sent_today)}\n"
+        f"Rejection examples: {len(rejections)} (used for learning)",
         parse_mode="HTML"
     )
 
@@ -1004,12 +1113,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sector off — remove sector filter\n"
         "/mute — pause auto-alerts\n"
         "/unmute — resume auto-alerts\n\n"
+        "<b>Quality</b>\n"
+        "👎 button — mark any alert as not relevant (bot learns)\n"
+        "/rejections — view rejection log and learning status\n"
+        "/feedback <i>message</i> — send general feedback\n\n"
         "<b>Info</b>\n"
         "/settings — current config and stats\n"
-        "/feedback <i>message</i> — send feedback\n"
         "/reset — clear all data and start fresh\n"
         "/help — this menu\n\n"
-        "<i>Auto-alerts run every 10 minutes when unmuted.</i>",
+        "<i>Auto-alerts run every 10 minutes when unmuted. "
+        "Tap 👎 on bad alerts to improve quality over time.</i>",
         parse_mode="HTML"
     )
 
@@ -1076,10 +1189,12 @@ def main():
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
+    app.add_handler(CommandHandler("rejections", cmd_rejections))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CallbackQueryHandler(handle_rejection_callback, pattern="^reject:"))
 
     t = threading.Thread(target=polling_loop, daemon=True)
     t.start()
