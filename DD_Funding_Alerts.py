@@ -39,7 +39,8 @@ KEYWORDS = [
     "funding", "raises", "raised", "series a", "series b", "series c",
     "seed round", "pre-seed", "investment", "crore", "million",
     "acquisition", "acquires", "acquired", "merger", "stake",
-    "debt financing", "venture debt", "ncd", "debenture"
+    "debt financing", "venture debt", "ncd", "debenture",
+    " mn", " cr ", "series d", "series e", "pre-series"
 ]
 
 EXCLUDE_KEYWORDS = [
