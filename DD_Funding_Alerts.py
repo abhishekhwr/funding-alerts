@@ -28,6 +28,7 @@ FEEDBACK_FILE = "/data/feedback_log.json"
 POLL_INTERVAL = 600
 MAX_AUTO_ALERTS = 3
 MAX_LATEST_ALERTS = 7
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Thread lock for shared state
 state_lock = threading.Lock()
@@ -144,6 +145,62 @@ def save_settings(settings):
             json.dump(settings, f)
     except Exception as e:
         print(f"Error saving settings: {e}")
+
+def parse_published_string(pub_str):
+    """Parse a published date string into a list [year, month, day, hour, min, sec] or None."""
+    if not pub_str or pub_str == "None":
+        return None
+    for fmt in [
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%a, %d %b %Y %H:%M:%S %Z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%d %b %Y %H:%M:%S %z",
+        "%B %d, %Y",
+    ]:
+        try:
+            dt = datetime.strptime(pub_str.strip(), fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt_utc = dt.astimezone(timezone.utc)
+            return [dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour, dt_utc.minute, dt_utc.second]
+        except ValueError:
+            continue
+    return None
+
+def backfill_archive_dates():
+    """One-time backfill: add published_parsed to old archive entries that only have published string."""
+    archive = load_json(ARCHIVE_FILE)
+    if not archive:
+        return
+    patched = 0
+    for entry in archive:
+        if entry.get("published_parsed") is None and entry.get("published"):
+            parsed = parse_published_string(entry["published"])
+            if parsed:
+                entry["published_parsed"] = parsed
+                patched += 1
+    if patched > 0:
+        save_json(ARCHIVE_FILE, archive, limit=5000)
+        print(f"Backfilled published_parsed for {patched} archive entries.")
+
+def get_article_date(article):
+    """Get UTC datetime from an archive article dict, trying published_parsed then published string."""
+    pp = article.get("published_parsed")
+    if pp:
+        try:
+            return datetime(*pp[:6], tzinfo=timezone.utc)
+        except Exception:
+            pass
+    # Fallback: parse the published string
+    pub_str = article.get("published", "")
+    parsed = parse_published_string(pub_str)
+    if parsed:
+        return datetime(*parsed[:6], tzinfo=timezone.utc)
+    return None
 
 def clean_text(text):
     text = re.sub(r'<[^>]+>', '', text)
@@ -671,18 +728,16 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     archive = load_json(ARCHIVE_FILE)
     sent_today = load_json(SENT_TODAY_FILE)
-    today = datetime.now(timezone.utc).date()
+    today_ist = datetime.now(IST).date()  # Use IST since target audience is India
     today_articles = []
 
     for a in archive:
-        pp = a.get("published_parsed")
-        if pp:
-            try:
-                pub_date = datetime(*pp[:3], tzinfo=timezone.utc).date()
-                if pub_date == today:
-                    today_articles.append(a)
-            except Exception:
-                pass
+        pub_date = get_article_date(a)
+        if pub_date:
+            # Convert to IST for date comparison
+            pub_date_ist = pub_date.astimezone(IST).date()
+            if pub_date_ist == today_ist:
+                today_articles.append(a)
 
     relevant = [a for a in today_articles if is_relevant_text(a.get("title", "") + " " + a.get("summary", ""))]
 
@@ -719,18 +774,14 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📅 Generating this week's funding summary...")
 
     archive = load_json(ARCHIVE_FILE)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    cutoff = datetime.now(IST) - timedelta(days=7)
     week_articles = []
 
     for a in archive:
-        pp = a.get("published_parsed")
-        if pp:
-            try:
-                pub_date = datetime(*pp[:6], tzinfo=timezone.utc)
-                if pub_date >= cutoff:
-                    week_articles.append(a)
-            except Exception:
-                pass
+        pub_date = get_article_date(a)
+        if pub_date:
+            if pub_date.astimezone(IST) >= cutoff:
+                week_articles.append(a)
 
     relevant = [a for a in week_articles if is_relevant_text(a.get("title", "") + " " + a.get("summary", ""))]
 
@@ -765,7 +816,7 @@ IMPORTANT formatting rules:
         summary = markdown_to_telegram_html(summary)
         await update.message.reply_text(
             f"📅 <b>Weekly Funding Digest</b>\n"
-            f"<i>{cutoff.strftime('%b %d')} — {datetime.now(timezone.utc).strftime('%b %d, %Y')}</i>\n\n"
+            f"<i>{cutoff.strftime('%b %d')} — {datetime.now(IST).strftime('%b %d, %Y')}</i>\n\n"
             f"{summary}",
             parse_mode="HTML"
         )
@@ -841,6 +892,38 @@ async def cmd_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_json(FEEDBACK_FILE, feedback_log, limit=500)
     await update.message.reply_text("✅ Feedback logged. Thanks for helping improve the bot!")
 
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reset all data files to start fresh. Requires confirmation."""
+    if not context.args or context.args[0].lower() != "confirm":
+        archive = load_json(ARCHIVE_FILE)
+        seen = load_json(SEEN_FILE)
+        await update.message.reply_text(
+            "⚠️ <b>Reset Bot Data</b>\n\n"
+            f"This will clear:\n"
+            f"• Archive: {len(archive)} articles\n"
+            f"• Tracked entries: {len(seen)}\n"
+            f"• Sent today log\n\n"
+            f"Settings (mute, sector filter) will be preserved.\n\n"
+            f"To confirm, run: /reset confirm",
+            parse_mode="HTML"
+        )
+        return
+
+    with state_lock:
+        save_json(SEEN_FILE, [])
+        save_json(SENT_TODAY_FILE, [])
+        save_json(ARCHIVE_FILE, [], limit=5000)
+
+    await update.message.reply_text(
+        "✅ <b>Data reset complete.</b>\n\n"
+        "• Archive cleared\n"
+        "• Tracked entries cleared\n"
+        "• Sent today cleared\n\n"
+        "The bot will start building a fresh archive from the next polling cycle (within 10 minutes), "
+        "or run /latest to populate immediately.",
+        parse_mode="HTML"
+    )
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = load_settings()
     seen = load_json(SEEN_FILE)
@@ -886,6 +969,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Info</b>\n"
         "/settings — current config and stats\n"
         "/feedback <i>message</i> — send feedback\n"
+        "/reset — clear all data and start fresh\n"
         "/help — this menu\n\n"
         "<i>Auto-alerts run every 10 minutes when unmuted.</i>",
         parse_mode="HTML"
@@ -941,6 +1025,9 @@ def main():
     validate_env()
     print("Bot starting...")
 
+    # Backfill published_parsed for old archive entries
+    backfill_archive_dates()
+
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("search", cmd_search))
@@ -951,6 +1038,7 @@ def main():
     app.add_handler(CommandHandler("mute", cmd_mute))
     app.add_handler(CommandHandler("unmute", cmd_unmute))
     app.add_handler(CommandHandler("feedback", cmd_feedback))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
@@ -963,4 +1051,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
