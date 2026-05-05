@@ -52,6 +52,7 @@ FEEDS = [
     "https://entrackr.com/feed/",
     "https://entrackr.com/snippets/feed/",
     "https://entrackr.com/exclusive/feed/",
+    "https://entrackr.com/snippets",
     "https://inc42.com/feed/",
     "https://inc42.com/buzz/feed/",
     "https://inc42.com/features/feed/",
