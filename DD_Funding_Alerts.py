@@ -11,7 +11,14 @@ from datetime import datetime, timezone, timedelta
 import threading
 from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    ApplicationHandlerStop,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    TypeHandler,
+)
 import anthropic
 
 # --- Configuration ---
@@ -1173,6 +1180,16 @@ def validate_env():
         print(f"FATAL: Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
 
+async def restrict_to_team_group(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    chat = update.effective_chat
+    allowed_chat_id = (CHAT_ID or "").strip()
+
+    if chat is None or str(chat.id) != allowed_chat_id:
+        raise ApplicationHandlerStop
+
 def main():
     validate_env()
     print("Bot starting...")
@@ -1181,6 +1198,11 @@ def main():
     backfill_archive_dates()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(
+        TypeHandler(Update, restrict_to_team_group, block=True),
+        group=-1,
+    )
     app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("summary", cmd_summary))
