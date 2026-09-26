@@ -635,15 +635,15 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
     MAX_LLM_CHECKS_PER_CYCLE = 15  # Cap LLM calls to control latency
 
     archive = load_json(ARCHIVE_FILE)
-    archive_ids = set(a.get("id") for a in archive)  # O(1) lookups
-    seen_set = set(seen)  # O(1) lookups
+    archive_ids = set(a.get("id") for a in archive)
+    seen_set = set(seen)
 
     for feed_url in FEEDS:
         if count >= max_alerts:
             break
         try:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:15]:  # Cap entries per feed to avoid slow feeds
+            for entry in feed.entries[:15]:
                 if count >= max_alerts:
                     break
                 entry_id = entry.get("id") or entry.get("link")
@@ -661,6 +661,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                     archive_ids.add(entry_id)
 
                 if entry_id not in seen_set:
+                    seen_set.add(entry_id)
                     new_seen.append(entry_id)
 
                     # Fast keyword filters first (no LLM cost)
@@ -687,7 +688,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                     real_url = resolve_url(entry.get("link", ""))
                     published_parsed = entry.published_parsed[:6] if hasattr(entry, 'published_parsed') and entry.published_parsed else None
 
-                    # Prepare alert (runs LLM extraction) BEFORE sending
+                    # Prepare alert before sending
                     prepared = prepare_alert(
                         entry.get("title", ""),
                         entry.get("summary", ""),
@@ -699,7 +700,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
 
                     message, final_url, company, entities = prepared
 
-                    # Company-level dedup: skip if same company already alerted this cycle
+                    # Skip companies already alerted this cycle
                     if company:
                         company_lower = company.lower().strip()
                         if company_lower in sent_companies:
@@ -707,13 +708,21 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                             continue
 
                     # Now send
-                    success, _ = send_prepared_alert(message, final_url, company, title=entry.get("title", ""), summary=entry.get("summary", ""))
+                    success, _ = send_prepared_alert(
+                        message,
+                        final_url,
+                        company,
+                        title=entry.get("title", ""),
+                        summary=entry.get("summary", "")
+                    )
                     if success:
                         new_sent.append(entry.get("title", ""))
                         if company:
                             sent_companies.add(company.lower().strip())
                         count += 1
-                    # If send failed, don't add to sent — will retry next cycle
+                    else:
+                        new_seen.remove(entry_id)
+                        print("Alert delivery not confirmed; eligible for a later poll.")
         except Exception as e:
             print(f"Feed error ({feed_url[:50]}): {e}")
 
