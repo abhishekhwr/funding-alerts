@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import hashlib
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse, quote_plus, urljoin
 from datetime import datetime, timezone, timedelta
 import threading
 from difflib import SequenceMatcher
@@ -57,10 +57,9 @@ def get_llm_client():
     return llm_client
 
 FEEDS = [
-    "https://entrackr.com/feed/",
-    "https://entrackr.com/snippets/feed/",
-    "https://entrackr.com/exclusive/feed/",
-    "https://entrackr.com/snippets",
+    "https://entrackr.com/rss",
+    "https://entrackr.com/rss/categories/snippets",
+    "https://entrackr.com/rss/categories/exclusive",
     "https://inc42.com/feed/",
     "https://inc42.com/buzz/feed/",
     "https://inc42.com/features/feed/",
@@ -410,12 +409,12 @@ def llm_call(prompt, max_tokens=300, retries=2):
 # --- LLM: Relevance Validation ---
 
 def llm_is_relevant(title, summary):
-    """Second-pass LLM filter: reject false positives that keyword filter let through.
+    """Return True/False for a confirmed decision, or None to retry later.
     Includes few-shot negative examples from user rejections for continuous learning."""
     text = f"Title: {title}\nSummary: {clean_text(summary)[:300]}"
     rejection_examples = get_rejection_examples()
 
-    answer = llm_call(f"""Is this article about a STARTUP or PRIVATE COMPANY involved in one of these events?
+    prompt = f"""Is this article about a STARTUP or PRIVATE COMPANY involved in one of these events?
 - Raising venture funding (seed, Series A/B/C/D, pre-seed, etc.)
 - A startup being acquired or merging
 - A startup taking on venture debt or debt financing
@@ -434,11 +433,22 @@ The focus is on INDIAN STARTUP ECOSYSTEM funding — private companies raising v
 {rejection_examples}
 {text}
 
-Answer ONLY "yes" or "no".""", max_tokens=10, retries=1)
+Answer ONLY "yes" or "no"."""
 
-    if answer is None:
-        return True  # Default to relevant on failure
-    return answer.lower().startswith("yes")
+    try:
+        answer = llm_call(prompt, max_tokens=10, retries=1)
+    except Exception as e:
+        print(f"Relevance check unavailable: {type(e).__name__}")
+        return None
+
+    if not isinstance(answer, str):
+        return None
+    decision = answer.strip().lower()
+    if decision == "yes":
+        return True
+    if decision == "no":
+        return False
+    return None  # Unexpected answers must not bypass the relevance check.
 
 # --- LLM: Entity Extraction ---
 
@@ -643,7 +653,19 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
         if count >= max_alerts:
             break
         try:
-            feed = feedparser.parse(feed_url)
+            response = requests.get(feed_url, timeout=(5, 15))
+            response.raise_for_status()
+            response_headers = {key.lower(): value for key, value in response.headers.items()}
+            response_headers["content-location"] = urljoin(
+                response.url, response_headers.get("content-location", "")
+            )
+            feed = feedparser.parse(response.content, response_headers=response_headers)
+            if not feed.get("version"):
+                print(f"Feed is not RSS/Atom; skipped: {feed_url}")
+                continue
+            if not feed.entries:
+                print(f"Feed has no entries: {feed_url}")
+                continue
             for entry in feed.entries[:15]:
                 if count >= max_alerts:
                     break
@@ -673,12 +695,20 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
                     if is_duplicate(entry.get("title", ""), sent_titles + new_sent):
                         continue
 
-                    # LLM second-pass relevance check (capped per cycle)
-                    if llm_checks < MAX_LLM_CHECKS_PER_CYCLE:
-                        llm_checks += 1
-                        if not llm_is_relevant(entry.get("title", ""), entry.get("summary", "")):
-                            print(f"LLM rejected: {entry.get('title', '')[:80]}")
-                            continue
+                    # Every candidate needs a confirmed relevance decision.
+                    # Leave unchecked articles eligible for a later poll.
+                    if llm_checks >= MAX_LLM_CHECKS_PER_CYCLE:
+                        new_seen.remove(entry_id)
+                        continue
+                    llm_checks += 1
+                    relevant = llm_is_relevant(entry.get("title", ""), entry.get("summary", ""))
+                    if relevant is None:
+                        new_seen.remove(entry_id)
+                        print(f"Relevance check deferred: {entry.get('title', '')[:80]}")
+                        continue
+                    if relevant is not True:
+                        print(f"LLM rejected: {entry.get('title', '')[:80]}")
+                        continue
 
                     # Sector filter
                     if sector_filter:
