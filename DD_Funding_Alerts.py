@@ -1,3 +1,4 @@
+import asyncio
 import feedparser
 import requests
 import time
@@ -733,25 +734,33 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
 
 async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Fetching latest funding news...")
-    with state_lock:
-        sent_today = load_json(SENT_TODAY_FILE)
-        seen = load_json(SEEN_FILE)
 
-    settings = load_settings()
-    sector = settings.get("sector_filter")
+    def fetch_latest():
+        with state_lock:
+            seen = load_json(SEEN_FILE)
+            sent_today = load_json(SENT_TODAY_FILE)
+            settings = load_settings()
 
-    new_seen, new_sent = fetch_and_alert(seen, sent_today, max_alerts=MAX_LATEST_ALERTS, sector_filter=sector)
+            new_seen, new_sent = fetch_and_alert(
+                seen,
+                sent_today,
+                max_alerts=MAX_LATEST_ALERTS,
+                sector_filter=settings.get("sector_filter"),
+            )
 
-    with state_lock:
-        seen = load_json(SEEN_FILE)
-        sent_today = load_json(SENT_TODAY_FILE)
-        seen = list(set(seen + new_seen))
-        sent_today = list(set(sent_today + new_sent))
-        save_json(SEEN_FILE, seen)
-        save_json(SENT_TODAY_FILE, sent_today)
+            seen = list(dict.fromkeys(seen + new_seen))
+            sent_today = list(dict.fromkeys(sent_today + new_sent))
+            save_json(SEEN_FILE, seen)
+            save_json(SENT_TODAY_FILE, sent_today)
+            return new_sent
+
+    new_sent = await asyncio.to_thread(fetch_latest)
 
     if not new_sent:
-        await update.message.reply_text("No new funding activity found right now. Try again later or use /summary for a digest.")
+        await update.message.reply_text(
+            "No new funding activity found right now. "
+            "Try again later or use /summary for a digest."
+        )
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -1071,10 +1080,13 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    with state_lock:
-        save_json(SEEN_FILE, [])
-        save_json(SENT_TODAY_FILE, [])
-        save_json(ARCHIVE_FILE, [], limit=5000)
+    def clear_saved_articles():
+        with state_lock:
+            save_json(SEEN_FILE, [])
+            save_json(SENT_TODAY_FILE, [])
+            save_json(ARCHIVE_FILE, [], limit=5000)
+
+    await asyncio.to_thread(clear_saved_articles)
 
     await update.message.reply_text(
         "✅ <b>Data reset complete.</b>\n\n"
@@ -1146,35 +1158,34 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Main ---
 
 def polling_loop():
-    with state_lock:
-        seen = load_json(SEEN_FILE)
-        sent_today = load_json(SENT_TODAY_FILE)
     last_reset = datetime.now().date()
 
     while True:
         try:
             settings = load_settings()
-            if settings.get("muted"):
-                time.sleep(POLL_INTERVAL)
-                continue
-
-            today = datetime.now().date()
-            if today != last_reset:
+            if not settings.get("muted"):
                 with state_lock:
-                    sent_today = []
+                    seen = load_json(SEEN_FILE)
+                    sent_today = load_json(SENT_TODAY_FILE)
+
+                    today = datetime.now().date()
+                    if today != last_reset:
+                        sent_today = []
+
+                    new_seen, new_sent = fetch_and_alert(
+                        seen,
+                        sent_today,
+                        sector_filter=settings.get("sector_filter"),
+                    )
+
+                    seen = list(dict.fromkeys(seen + new_seen))
+                    sent_today = list(dict.fromkeys(sent_today + new_sent))
+                    save_json(SEEN_FILE, seen)
                     save_json(SENT_TODAY_FILE, sent_today)
-                last_reset = today
-
-            sector_filter = settings.get("sector_filter")
-            new_seen, new_sent = fetch_and_alert(seen, sent_today, sector_filter=sector_filter)
-
-            with state_lock:
-                seen = list(set(seen + new_seen))
-                sent_today = list(set(sent_today + new_sent))
-                save_json(SEEN_FILE, seen)
-                save_json(SENT_TODAY_FILE, sent_today)
+                    last_reset = today
         except Exception as e:
             print(f"Polling error: {e}")
+
         time.sleep(POLL_INTERVAL)
 
 def validate_env():
