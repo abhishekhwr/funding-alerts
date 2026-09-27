@@ -12,6 +12,8 @@ from urllib.parse import urlparse, quote_plus, urljoin, urlsplit, urlunsplit, pa
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone, timedelta
 import threading
+import tempfile
+from collections import deque
 from difflib import SequenceMatcher
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -33,6 +35,7 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY")
 SEEN_FILE = "/data/seen_entries.json"
 SENT_TODAY_FILE = "/data/sent_today.json"
 ARCHIVE_FILE = "/data/article_archive.json"
+SCAN_STATE_FILE = "/data/scan_state.json"
 SETTINGS_FILE = "/data/bot_settings.json"
 FEEDBACK_FILE = "/data/feedback_log.json"
 REJECTIONS_FILE = "/data/rejections.json"
@@ -41,6 +44,12 @@ MAX_REJECTION_EXAMPLES = 15  # Max examples to inject into LLM prompt
 POLL_INTERVAL = 600
 MAX_AUTO_ALERTS = 3
 MAX_LATEST_ALERTS = 7
+MAX_FEED_ENTRIES = 50
+MAX_RELEVANCE_CHECKS = 15
+MAX_QUEUE_ATTEMPTS = 30
+QUEUE_WARNING_SIZE = 500
+ARTICLE_MAX_AGE_DAYS = 14
+DELIVERY_RETENTION_DAYS = 30
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # Thread lock for shared state
@@ -910,138 +919,307 @@ def send_text(text):
 
 # --- Feed Fetching ---
 
-def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter=None):
-    new_seen = []
-    new_sent = []
-    count = 0
-    llm_checks = 0
-    MAX_LLM_CHECKS_PER_CYCLE = 15  # Cap LLM calls to control latency
+def empty_scan_state():
+    return {"version": 1, "pending": {}, "completed": {}, "deliveries": [],
+            "source_cursor": "", "delivery_cursor": "", "last_cycle": {}}
 
-    archive = load_json(ARCHIVE_FILE)
-    archive_ids = set(a.get("id") for a in archive)
+
+def load_scan_state():
+    """Never silently replace a damaged queue with an empty one."""
+    if not os.path.exists(SCAN_STATE_FILE):
+        return empty_scan_state()
+    with open(SCAN_STATE_FILE, encoding="utf-8") as handle:
+        state = json.load(handle)
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise ValueError("Unsupported or damaged scan state; queue was left untouched")
+    state.setdefault("delivery_cursor", "")
+    for key, kind in (("pending", dict), ("completed", dict), ("deliveries", list),
+                      ("source_cursor", str), ("delivery_cursor", str), ("last_cycle", dict)):
+        if not isinstance(state.get(key), kind):
+            raise ValueError("Damaged scan state: " + key)
+    for key, item in state["pending"].items():
+        if (not isinstance(key, str) or not isinstance(item, dict)
+                or not isinstance(item.get("article"), dict)
+                or not isinstance(item.get("source"), str)
+                or not isinstance(item.get("discovered_at"), (int, float))
+                or not isinstance(item.get("retry_at"), (int, float))
+                or not isinstance(item.get("attempts"), int)
+                or (item.get("verdict") is not None and item.get("verdict") is not True)):
+            raise ValueError("Damaged queued article; queue was left untouched")
+        if any(not isinstance(item["article"].get(field), str) for field in ("id", "title", "summary", "url")):
+            raise ValueError("Damaged queued article fields; queue was left untouched")
+    for record in state["completed"].values():
+        if not isinstance(record, dict) or not isinstance(record.get("at"), (int, float)):
+            raise ValueError("Damaged queue completion history")
+    if any(not isinstance(record, dict) for record in state["deliveries"]):
+        raise ValueError("Damaged queue delivery history")
+    return state
+
+
+def save_scan_state(state):
+    """Atomic, strict checkpoint: failed writes stop processing before more sends."""
+    folder = os.path.dirname(SCAN_STATE_FILE) or "."
+    os.makedirs(folder, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=folder,
+                                         prefix=".scan-state-", suffix=".tmp", delete=False) as handle:
+            temp_path = handle.name
+            json.dump(state, handle, ensure_ascii=False, allow_nan=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, SCAN_STATE_FILE)
+        temp_path = None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def queue_article_key(article, source):
+    url = canonical_article_url(article.get("url", ""))
+    identity = "url:" + url if url else "id:" + source + ":" + str(article.get("id", ""))
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def finish_queue_item(state, key, reason, now, new_seen):
+    item = state["pending"].pop(key)
+    state["completed"][key] = {"at": now, "reason": reason}
+    entry_id = item["article"].get("id")
+    if entry_id and entry_id not in new_seen:
+        new_seen.append(entry_id)
+
+
+def retry_queue_item(item, now):
+    item["attempts"] += 1
+    delay = min(POLL_INTERVAL * (2 ** min(item["attempts"] - 1, 6)), 6 * 3600)
+    item["retry_at"] = now + delay
+
+
+def prune_scan_state(state, now, new_seen):
+    cutoff = now - ARTICLE_MAX_AGE_DAYS * 86400
+    expired = 0
+    for key, item in list(state["pending"].items()):
+        published = get_article_date(item["article"])
+        age_start = min(published.timestamp(), item["discovered_at"]) if published else item["discovered_at"]
+        if age_start < cutoff:
+            finish_queue_item(state, key, "expired", now, new_seen)
+            expired += 1
+    history_cutoff = now - DELIVERY_RETENTION_DAYS * 86400
+    state["completed"] = {key: value for key, value in state["completed"].items()
+                          if value["at"] >= history_cutoff}
+    retained = []
+    for record in state["deliveries"]:
+        try:
+            if datetime.fromisoformat(record["delivered_at"]).timestamp() >= history_cutoff:
+                retained.append(record)
+        except (KeyError, TypeError, ValueError):
+            # Unknown history must not be discarded just because its date is missing.
+            retained.append(record)
+    state["deliveries"] = retained
+    return expired
+
+
+def fair_pending_items(state, now, approved_only=False):
+    """Oldest first within each source; rotate sources across cycles and restarts."""
+    groups = {}
+    for key, item in state["pending"].items():
+        if item["retry_at"] <= now and (not approved_only or item["verdict"] is True):
+            groups.setdefault(item["source"], []).append((key, item))
+    sources = sorted(groups)
+    cursor = state["delivery_cursor"] if approved_only else state["source_cursor"]
+    sources = [source for source in sources if source > cursor] + [source for source in sources if source <= cursor]
+    groups = {source: deque(sorted(items, key=lambda pair: pair[1]["discovered_at"]))
+              for source, items in groups.items()}
+    while sources:
+        remaining = []
+        for source in sources:
+            yield groups[source].popleft()
+            if groups[source]:
+                remaining.append(source)
+        sources = remaining
+
+
+def collect_feed_articles(state, archive, seen, sent_titles, stats, now, new_seen):
     archive_by_id = {a.get("id"): a for a in archive}
-    deliveries = archive_deliveries(archive)
-    seen_set = set(seen)
-
+    seen_ids = set(seen)
+    deliveries = archive_deliveries(archive) + state["deliveries"]
     for feed_url in FEEDS:
-        if count >= max_alerts:
-            break
+        stats["feeds_attempted"] += 1
         try:
             response = requests.get(feed_url, timeout=(5, 15))
             response.raise_for_status()
-            response_headers = {key.lower(): value for key, value in response.headers.items()}
-            response_headers["content-location"] = urljoin(
-                response.url, response_headers.get("content-location", "")
-            )
-            feed = feedparser.parse(response.content, response_headers=response_headers)
-            if not feed.get("version"):
-                print(f"Feed is not RSS/Atom; skipped: {feed_url}")
-                continue
-            if not feed.entries:
-                print(f"Feed has no entries: {feed_url}")
-                continue
-            for entry in feed.entries[:15]:
-                if count >= max_alerts:
-                    break
+            headers = {key.lower(): value for key, value in response.headers.items()}
+            headers["content-location"] = urljoin(response.url, headers.get("content-location", ""))
+            feed = feedparser.parse(response.content, response_headers=headers)
+            if not feed.get("version") or not feed.entries:
+                raise ValueError("Feed is empty or is not RSS/Atom")
+            stats["feeds_ok"] += 1
+        except Exception as error:
+            stats["feed_errors"].append(feed_url)
+            print(f"Feed unavailable ({feed_url[:70]}): {type(error).__name__}")
+            continue
+
+        for entry in feed.entries[:MAX_FEED_ENTRIES]:
+            stats["articles_scanned"] += 1
+            try:
                 entry_id = entry.get("id") or entry.get("link")
-                if not entry_id:
+                if not isinstance(entry_id, str) or not entry_id:
                     continue
-
-                archive_entry = {
-                    "id": entry_id,
-                    "title": entry.get("title", ""),
-                    "summary": entry.get("summary", ""),
-                    "url": entry.get("link", ""),
-                    "published": str(entry.get("published", "")),
-                    "published_parsed": list(entry.published_parsed[:6]) if hasattr(entry, 'published_parsed') and entry.published_parsed else None,
-                }
-                if entry_id not in archive_ids:
-                    archive.append(archive_entry)
-                    archive_ids.add(entry_id)
-                    archive_by_id[entry_id] = archive_entry
-
-                if entry_id not in seen_set:
-                    seen_set.add(entry_id)
+                pp = entry.get("published_parsed")
+                article = {"id": entry_id, "title": str(entry.get("title") or "")[:1000],
+                           "summary": str(entry.get("summary") or "")[:12000],
+                           "url": str(entry.get("link") or ""),
+                           "published": str(entry.get("published") or ""),
+                           "published_parsed": list(pp[:6]) if pp else None}
+                if entry_id not in archive_by_id:
+                    archive.append(article)
+                    archive_by_id[entry_id] = article
+                key = queue_article_key(article, feed_url)
+                if key in state["pending"] or key in state["completed"]:
+                    continue
+                # Preserve legacy seen history; installing this change is not a bulk replay.
+                if entry_id in seen_ids:
+                    state["completed"][key] = {"at": now, "reason": "legacy_seen"}
+                    continue
+                published = get_article_date(article)
+                too_old = published and published.timestamp() < now - ARTICLE_MAX_AGE_DAYS * 86400
+                duplicate = is_duplicate(article["title"], sent_titles) or article_already_delivered(article["title"], article["url"], deliveries)
+                if too_old or duplicate or not is_relevant(article):
+                    state["completed"][key] = {"at": now, "reason": "ineligible"}
                     new_seen.append(entry_id)
+                    seen_ids.add(entry_id)
+                    continue
+                state["pending"][key] = {"article": dict(article), "source": feed_url,
+                                          "discovered_at": now, "verdict": None,
+                                          "attempts": 0, "retry_at": 0}
+                stats["queued_new"] += 1
+            except Exception as error:
+                stats["entry_errors"] += 1
+                print(f"Feed entry deferred ({feed_url[:70]}): {type(error).__name__}")
 
-                    # Fast keyword filters first (no LLM cost)
-                    if not is_relevant(entry):
-                        continue
-                    if not is_recent(entry):
-                        continue
-                    if is_duplicate(entry.get("title", ""), sent_titles + new_sent) or article_already_delivered(
-                        entry.get("title", ""), entry.get("link", ""), deliveries
-                    ):
-                        continue
 
-                    # Every candidate needs a confirmed relevance decision.
-                    # Leave unchecked articles eligible for a later poll.
-                    if llm_checks >= MAX_LLM_CHECKS_PER_CYCLE:
-                        new_seen.remove(entry_id)
-                        continue
-                    llm_checks += 1
-                    relevant = llm_is_relevant(entry.get("title", ""), entry.get("summary", ""))
-                    if relevant is None:
-                        new_seen.remove(entry_id)
-                        print(f"Relevance check deferred: {entry.get('title', '')[:80]}")
-                        continue
-                    if relevant is not True:
-                        print(f"LLM rejected: {entry.get('title', '')[:80]}")
-                        continue
+def process_scan_queue(state, archive, sent_titles, max_alerts, sector_filter, stats, now, new_seen):
+    deliveries = archive_deliveries(archive) + state["deliveries"]
+    archive_by_id = {a.get("id"): a for a in archive}
+    new_sent = []
 
-                    try:
-                        # Sector filter
-                        if sector_filter:
-                            entities = extract_entities_llm(entry.get("title", ""), entry.get("summary", ""))
-                            if entities.get("sector", "").lower() != sector_filter.lower():
-                                continue
+    # First classify fairly. This cursor must never change who gets the next send slot.
+    for key, item in fair_pending_items(state, now):
+        if stats["queue_attempts"] >= MAX_QUEUE_ATTEMPTS or stats["relevance_checks"] >= MAX_RELEVANCE_CHECKS:
+            break
+        if item["verdict"] is True:
+            continue
+        article = item["article"]
+        title, summary = article["title"], article["summary"]
+        stats["queue_attempts"] += 1
+        state["source_cursor"] = item["source"]
+        reason = None
+        try:
+            if is_duplicate(title, sent_titles) or article_already_delivered(title, article["url"], deliveries):
+                reason = "duplicate"
+            else:
+                stats["relevance_checks"] += 1
+                verdict = llm_is_relevant(title, summary)
+                if verdict is False:
+                    stats["rejected"] += 1
+                    reason = "irrelevant"
+                elif verdict is True:
+                    item["verdict"] = True
+                    item["attempts"] = 0
+                else:
+                    retry_queue_item(item, time.time())
+                    stats["deferred"] += 1
+        except Exception as error:
+            retry_queue_item(item, time.time())
+            stats["deferred"] += 1
+            print(f"Relevance deferred: {type(error).__name__}: {title[:70]}")
+        if reason:
+            finish_queue_item(state, key, reason, now, new_seen)
+        save_scan_state(state)
 
-                        real_url = resolve_url(entry.get("link", ""))
-                        published_parsed = entry.published_parsed[:6] if hasattr(entry, 'published_parsed') and entry.published_parsed else None
-
-                        prepared = prepare_alert(
-                            entry.get("title", ""),
-                            entry.get("summary", ""),
-                            real_url,
-                            published_parsed
-                        )
-                    except RetryableExtractionError:
-                        new_seen.remove(entry_id)
-                        print(f"Alert extraction deferred: {entry.get('title', '')[:80]}")
-                        continue
-                    if prepared is None:
-                        continue
-
-                    message, final_url, company, entities = prepared
-
-                    delivery = build_delivery_record(entry.get("title", ""), final_url, entities, published_parsed)
-                    if article_already_delivered(entry.get("title", ""), final_url, deliveries) or any(same_deal(delivery, previous) for previous in deliveries):
-                        print(f"Skipped previously delivered deal: {company} - {entry.get('title', '')[:60]}")
-                        continue
-
-                    # Now send
-                    success, _ = send_prepared_alert(
-                        message,
-                        final_url,
-                        company,
-                        title=entry.get("title", ""),
-                        summary=entry.get("summary", "")
-                    )
-                    if success:
-                        new_sent.append(entry.get("title", ""))
-                        archive_by_id[entry_id]["delivery"] = delivery
-                        deliveries.append(delivery)
-                        # Persist successful delivery metadata before processing the next story.
-                        save_json(ARCHIVE_FILE, archive, limit=5000)
-                        count += 1
+    # Then give approved articles independent, persistent, rotating delivery slots.
+    for key, item in fair_pending_items(state, now, approved_only=True):
+        if stats["queue_attempts"] >= MAX_QUEUE_ATTEMPTS or stats["send_attempts"] >= max_alerts:
+            break
+        stats["queue_attempts"] += 1
+        state["delivery_cursor"] = item["source"]
+        article = item["article"]
+        title, summary = article["title"], article["summary"]
+        reason, delivery = None, None
+        try:
+            if is_duplicate(title, sent_titles + new_sent) or article_already_delivered(title, article["url"], deliveries):
+                reason = "duplicate"
+            else:
+                url = resolve_url(article["url"])
+                pp = article.get("published_parsed") or parse_published_string(article.get("published", ""))
+                prepared = prepare_alert(title, summary, url, pp)
+                if prepared is None:
+                    reason = "low_quality"
+                else:
+                    message, url, company, entities = prepared
+                    if sector_filter and entities.get("sector", "").casefold() != sector_filter.casefold():
+                        reason = "sector_mismatch"
                     else:
-                        new_seen.remove(entry_id)
-                        print("Alert delivery not confirmed; eligible for a later poll.")
-        except Exception as e:
-            print(f"Feed error ({feed_url[:50]}): {e}")
+                        record = build_delivery_record(title, url, entities, pp)
+                        if article_already_delivered(title, url, deliveries) or any(same_deal(record, previous) for previous in deliveries):
+                            reason = "duplicate"
+                        else:
+                            stats["send_attempts"] += 1
+                            success, _ = send_prepared_alert(message, url, company, title=title, summary=summary)
+                            if success:
+                                delivery = record
+                                reason = "delivered"
+                                new_sent.append(title)
+                                stats["sent"] += 1
+                            else:
+                                retry_queue_item(item, time.time())
+                                stats["deferred"] += 1
+        except Exception as error:
+            retry_queue_item(item, time.time())
+            stats["deferred"] += 1
+            print(f"Queued alert deferred: {type(error).__name__}: {title[:70]}")
+        if delivery:
+            state["deliveries"].append(delivery)
+            deliveries.append(delivery)
+        if reason:
+            finish_queue_item(state, key, reason, now, new_seen)
+        # Do not swallow disk errors or send another alert after a failed checkpoint.
+        save_scan_state(state)
+        if delivery:
+            stored = archive_by_id.get(article["id"])
+            if stored is None:
+                stored = dict(article)
+                archive.append(stored)
+                archive_by_id[article["id"]] = stored
+            stored["delivery"] = delivery
+            save_json(ARCHIVE_FILE, archive, limit=5000)
+    return new_sent
 
+
+def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter=None, process_pending=True):
+    """Caller holds state_lock. Intake all feeds, checkpoint, then drain saved work."""
+    now = time.time()
+    state = load_scan_state()
+    archive = load_json(ARCHIVE_FILE)
+    new_seen = []
+    stats = {"started_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+             "feeds_attempted": 0, "feeds_ok": 0, "feed_errors": [], "entry_errors": 0,
+             "articles_scanned": 0, "queued_new": 0, "queue_attempts": 0,
+             "relevance_checks": 0, "send_attempts": 0, "sent": 0,
+             "rejected": 0, "deferred": 0, "expired": prune_scan_state(state, now, new_seen)}
+    collect_feed_articles(state, archive, seen, sent_titles, stats, now, new_seen)
+    state["last_cycle"] = stats
+    save_scan_state(state)  # Must succeed before any paid checks or Telegram sends.
     save_json(ARCHIVE_FILE, archive, limit=5000)
-    return new_seen, new_sent
+    new_sent = process_scan_queue(state, archive, sent_titles, max_alerts, sector_filter, stats, time.time(), new_seen) if process_pending else []
+    stats["pending"] = len(state["pending"])
+    stats["approved_waiting"] = sum(item["verdict"] is True for item in state["pending"].values())
+    stats["finished_at"] = datetime.now(timezone.utc).isoformat()
+    state["last_cycle"] = stats
+    save_scan_state(state)
+    print("Scan cycle: " + json.dumps(stats))
+    return list(dict.fromkeys(new_seen)), new_sent
+
 
 # --- Bot Commands ---
 
@@ -1067,13 +1245,23 @@ async def cmd_latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_json(SENT_TODAY_FILE, sent_today)
             return new_sent
 
-    new_sent = await asyncio.to_thread(fetch_latest)
+    try:
+        new_sent = await asyncio.to_thread(fetch_latest)
+    except Exception as error:
+        print(f"Manual scan failed: {type(error).__name__}: {error}")
+        await update.message.reply_text("The scan could not finish. Check Railway logs; please keep the saved queue so unfinished work can be recovered.")
+        return
 
     if not new_sent:
-        await update.message.reply_text(
-            "No new funding activity found right now. "
-            "Try again later or use /summary for a digest."
-        )
+        state = load_scan_state()
+        waiting = len(state["pending"])
+        if waiting:
+            message = f"No alerts sent on this request. {waiting} articles remain queued for checks or delivery. Automatic polls will continue processing them when unmuted."
+        elif state["last_cycle"].get("feed_errors"):
+            message = "No new verified alerts sent. Some feeds could not be checked; see /status."
+        else:
+            message = "No new verified funding alerts found. Use /summary for a digest."
+        await update.message.reply_text(message)
 
 def newest_articles(articles, days=None):
     cutoff = datetime.now(timezone.utc) - timedelta(days=days) if days else None
@@ -1100,7 +1288,8 @@ def send_archive_alerts(query=None):
         else:
             today = datetime.now(IST).date()
             articles = [a for a in archive if get_article_date(a) is not None and get_article_date(a).astimezone(IST).date() == today]
-        records = [] if replay else archive_deliveries(archive)
+        scan_state = None if replay else load_scan_state()
+        records = [] if replay else archive_deliveries(archive) + scan_state["deliveries"]
         previous_titles = [] if replay else load_json(SENT_TODAY_FILE)
         skipped, retryable, eligible = 0, 0, []
         for article in newest_articles(articles):
@@ -1138,6 +1327,11 @@ def send_archive_alerts(query=None):
             sent.append(title)
             records.append(record)
             if not replay:
+                scan_state["deliveries"].append(record)
+                for key, item in list(scan_state["pending"].items()):
+                    if article_already_delivered(title, item["article"].get("url", ""), [record]):
+                        finish_queue_item(scan_state, key, "delivered_manually", time.time(), [])
+                save_scan_state(scan_state)
                 article["delivery"] = record
                 save_json(ARCHIVE_FILE, archive, limit=5000)
                 save_json(SENT_TODAY_FILE, list(dict.fromkeys(previous_titles + sent)))
@@ -1287,7 +1481,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_settings(settings)
     await update.message.reply_text(
         "🔇 Auto-alerts <b>muted</b>. You can still use /latest, /search, /summary manually.\n"
-        "Use /unmute to resume auto-alerts.",
+        "Scanning continues and articles wait in the queue. Use /unmute to resume auto-alerts.",
         parse_mode="HTML"
     )
 
@@ -1387,7 +1581,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"This will clear:\n"
             f"• Archive: {len(archive)} articles\n"
             f"• Tracked entries: {len(seen)}\n"
-            f"• Sent today log\n\n"
+            f"• Sent today log and pending queue\n\n"
             f"Settings (mute, sector filter) will be preserved.\n\n"
             f"To confirm, run: /reset confirm",
             parse_mode="HTML"
@@ -1396,6 +1590,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     def clear_saved_articles():
         with state_lock:
+            save_scan_state(empty_scan_state())
             save_json(SEEN_FILE, [])
             save_json(SENT_TODAY_FILE, [])
             save_json(ARCHIVE_FILE, [], limit=5000)
@@ -1406,11 +1601,45 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ <b>Data reset complete.</b>\n\n"
         "• Archive cleared\n"
         "• Tracked entries cleared\n"
-        "• Sent today cleared\n\n"
-        "The bot will start building a fresh archive from the next polling cycle (within 10 minutes), "
+        "• Sent today and pending queue cleared\n\n"
+        "The bot will start building a fresh archive from the next polling cycle, "
         "or run /latest to populate immediately.",
         parse_mode="HTML"
     )
+
+def scan_status_text():
+    try:
+        state = load_scan_state()
+    except Exception:
+        return "\n\n⚠️ Saved queue unavailable. Check Railway logs before resetting anything."
+    pending = list(state["pending"].values())
+    approved = sum(item["verdict"] is True for item in pending)
+    text = (f"\n\n📥 <b>Processing queue</b>\n"
+            f"Awaiting relevance check: {len(pending) - approved}\n"
+            f"Passed relevance; awaiting final checks/delivery: {approved}")
+    oldest_hours = max(0, (time.time() - min(item["discovered_at"] for item in pending)) / 3600) if pending else 0
+    if pending:
+        text += f"\nOldest waiting article: {oldest_hours:.1f}h"
+    if len(pending) >= QUEUE_WARNING_SIZE or oldest_hours >= 24:
+        text += "\n⚠️ Backlog needs attention; some articles are waiting a long time or the queue is large."
+    stats = state["last_cycle"]
+    if stats:
+        started = datetime.fromisoformat(stats["started_at"]).astimezone(IST).strftime("%d %b, %H:%M IST")
+        text += (f"\n\n🔎 <b>Last cycle</b> — {started}\n"
+                 f"Feeds read: {stats.get('feeds_ok', 0)}/{stats.get('feeds_attempted', 0)}\n"
+                 f"Feeds unavailable/empty: {len(stats.get('feed_errors', []))}\n"
+                 f"Article entries scanned: {stats.get('articles_scanned', 0)}\n"
+                 f"New articles queued: {stats.get('queued_new', 0)}\n"
+                 f"Relevance checks: {stats.get('relevance_checks', 0)}/{MAX_RELEVANCE_CHECKS}\n"
+                 f"Alerts sent: {stats.get('sent', 0)}\n"
+                 f"Retries deferred: {stats.get('deferred', 0)}\n"
+                 f"Expired beyond {ARTICLE_MAX_AGE_DAYS} days: {stats.get('expired', 0)}")
+        if not stats.get("finished_at"):
+            text += "\nCycle is running or did not finish; check logs if this persists."
+    else:
+        text += "\nNo scan completed with this version yet."
+    return text
+
 
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     settings = load_settings()
@@ -1429,12 +1658,14 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Poll interval:</b> Every 10 minutes\n"
         f"<b>Max auto-alerts/cycle:</b> {MAX_AUTO_ALERTS}\n"
         f"<b>Max on-demand alerts:</b> {MAX_LATEST_ALERTS}\n"
+        f"<b>Articles examined/feed:</b> Up to {MAX_FEED_ENTRIES}\n"
         f"<b>Feeds monitored:</b> {len(FEEDS)}\n\n"
         f"📊 <b>Stats</b>\n"
         f"Articles tracked: {len(seen)}\n"
         f"Archive size: {len(archive)}\n"
         f"Sent today: {len(sent_today)}\n"
-        f"Rejection examples: {len(rejections)} (used for learning)",
+        f"Rejection examples: {len(rejections)} (used for learning)"
+        + scan_status_text(),
         parse_mode="HTML"
     )
 
@@ -1454,7 +1685,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Filters</b>\n"
         "/sector <i>name</i> — filter alerts by sector\n"
         "/sector off — remove sector filter\n"
-        "/mute — pause auto-alerts\n"
+        "/mute — pause auto-alerts; scanning continues\n"
         "/unmute — resume auto-alerts\n\n"
         "<b>Quality</b>\n"
         "👎 button — mark any alert as not relevant (bot learns)\n"
@@ -1472,35 +1703,32 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Main ---
 
 def polling_loop():
-    last_reset = datetime.now().date()
+    last_reset = datetime.now(IST).date()
 
     while True:
+        started = time.monotonic()
         try:
-            settings = load_settings()
-            if not settings.get("muted"):
-                with state_lock:
-                    seen = load_json(SEEN_FILE)
-                    sent_today = load_json(SENT_TODAY_FILE)
+            with state_lock:
+                settings = load_settings()
+                seen = load_json(SEEN_FILE)
+                sent_today = load_json(SENT_TODAY_FILE)
+                today = datetime.now(IST).date()
+                if today != last_reset:
+                    sent_today = []
+                new_seen, new_sent = fetch_and_alert(
+                    seen, sent_today,
+                    sector_filter=settings.get("sector_filter"),
+                    process_pending=not settings.get("muted"),
+                )
+                save_json(SEEN_FILE, list(dict.fromkeys(seen + new_seen)))
+                save_json(SENT_TODAY_FILE, list(dict.fromkeys(sent_today + new_sent)))
+                last_reset = today
+        except Exception as error:
+            print(f"Polling error: {error}")
 
-                    today = datetime.now().date()
-                    if today != last_reset:
-                        sent_today = []
+        # Aim for ten minutes between starts; never overlap background cycles.
+        time.sleep(max(1, POLL_INTERVAL - (time.monotonic() - started)))
 
-                    new_seen, new_sent = fetch_and_alert(
-                        seen,
-                        sent_today,
-                        sector_filter=settings.get("sector_filter"),
-                    )
-
-                    seen = list(dict.fromkeys(seen + new_seen))
-                    sent_today = list(dict.fromkeys(sent_today + new_sent))
-                    save_json(SEEN_FILE, seen)
-                    save_json(SENT_TODAY_FILE, sent_today)
-                    last_reset = today
-        except Exception as e:
-            print(f"Polling error: {e}")
-
-        time.sleep(POLL_INTERVAL)
 
 def validate_env():
     missing = []
