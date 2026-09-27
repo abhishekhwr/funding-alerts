@@ -52,6 +52,13 @@ MAX_QUEUE_ATTEMPTS = 30
 QUEUE_WARNING_SIZE = 500
 ARTICLE_MAX_AGE_DAYS = 14
 DELIVERY_RETENTION_DAYS = 30
+FEED_FAILURE_CHECKS = 3
+FEED_FAILURE_GRACE = 20 * 60
+FEED_HEALTH_REMINDER = 24 * 60 * 60
+FEED_HTTP_HEADERS = {
+    "User-Agent": "FundingAlerts/1.0 (+https://github.com/abhishekhwr/funding-alerts)",
+    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.5",
+}
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # Thread lock for shared state
@@ -77,10 +84,13 @@ FEEDS = [
     "https://inc42.com/buzz/feed/",
     "https://inc42.com/features/feed/",
     "https://yourstory.com/feed",
-    "https://www.vccircle.com/feed",
-    "https://economictimes.indiatimes.com/small-biz/startups/rss.cms",
-    "https://www.livemint.com/rss/startup",
-    "https://www.business-standard.com/rss/startups-10304.rss",
+    "https://news.google.com/rss/search?q=site%3Avccircle.com+%28intitle%3Araises+OR+intitle%3Araised+OR+intitle%3Araise+OR+intitle%3Apocket+OR+intitle%3Apockets+OR+intitle%3Asecures+OR+intitle%3Aacquires%29+when%3A14d&hl=en-IN&gl=IN&ceid=IN%3Aen",
+    "https://economictimes.indiatimes.com/tech/funding/rssfeeds/78570550.cms",
+    "https://www.livemint.com/rss/companies",
+    "https://news.google.com/rss/search?q=site%3Abusiness-standard.com+%28startup+OR+venture%29+%28raises+OR+funding%29+when%3A14d&hl=en-IN&gl=IN&ceid=IN%3Aen",
+    "https://indianstartupnews.com/rss/categories/funding",
+    "https://www.indianstartuptimes.com/category/investment/feed/",
+    "https://india.entrepreneur.com/topic/funding/feed",
     "https://news.google.com/rss/search?q=india+startup+funding+raised&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+series+a+series+b+raised&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+startup+seed+funding+2026&hl=en-IN&gl=IN&ceid=IN:en",
@@ -88,8 +98,26 @@ FEEDS = [
     "https://news.google.com/rss/search?q=india+startup+acquisition+merger&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+startup+debt+financing&hl=en-IN&gl=IN&ceid=IN:en",
     "https://news.google.com/rss/search?q=india+unicorn+funding+raised&hl=en-IN&gl=IN&ceid=IN:en",
-    "https://news.google.com/rss/search?q=india+startup+closes+round+2026&hl=en-IN&gl=IN&ceid=IN:en",
+    "https://news.google.com/rss/search?q=india+startup+closes+round+2026&hl=en-IN&gl=IN&ceid=IN:en"
 ]
+
+# Direct publisher feeds plus explicitly labelled Google News discovery fallbacks.
+FEED_LABELS = {
+    "https://entrackr.com/rss": "Entrackr — main",
+    "https://entrackr.com/rss/categories/snippets": "Entrackr — snippets",
+    "https://entrackr.com/rss/categories/exclusive": "Entrackr — exclusives",
+    "https://inc42.com/feed/": "Inc42 — main",
+    "https://inc42.com/buzz/feed/": "Inc42 — buzz",
+    "https://inc42.com/features/feed/": "Inc42 — features",
+    "https://yourstory.com/feed": "YourStory",
+    "https://news.google.com/rss/search?q=site%3Avccircle.com+%28intitle%3Araises+OR+intitle%3Araised+OR+intitle%3Araise+OR+intitle%3Apocket+OR+intitle%3Apockets+OR+intitle%3Asecures+OR+intitle%3Aacquires%29+when%3A14d&hl=en-IN&gl=IN&ceid=IN%3Aen": "VCCircle — via Google News",
+    "https://economictimes.indiatimes.com/tech/funding/rssfeeds/78570550.cms": "Economic Times — funding",
+    "https://www.livemint.com/rss/companies": "Mint — companies",
+    "https://news.google.com/rss/search?q=site%3Abusiness-standard.com+%28startup+OR+venture%29+%28raises+OR+funding%29+when%3A14d&hl=en-IN&gl=IN&ceid=IN%3Aen": "Business Standard — via Google News",
+    "https://indianstartupnews.com/rss/categories/funding": "IndianStartupNews — funding",
+    "https://www.indianstartuptimes.com/category/investment/feed/": "Indian Startup Times — investment",
+    "https://india.entrepreneur.com/topic/funding/feed": "Entrepreneur India — funding"
+}
 
 KEYWORDS = [
     "funding", "raises", "raised", "series a", "series b", "series c",
@@ -883,6 +911,11 @@ def funding_facts_in_text(text):
 
     for money in MONEY_RE.finditer(text):
         before, after = text[:money.start()], text[money.end():]
+        # A malformed unit such as "USD 6.7 milliion" must not turn into
+        # "USD 6.7". Leave it unstated so a clear headline can supply it.
+        if re.search(r"\d$", money.group(0)) and re.match(
+                r"\s+(?:mill\w*|bill\w*|cro\w*|lak\w*|thous\w*)\b", after, re.I):
+            continue
         # Valuation must be explicitly adjacent to this particular number.
         valuation_before = re.search(
             r"(?:(pre[-\s]money|post[-\s]money)\s+)?(?:valuation(?:\s+(?:of|at))?|valued\s+at)\s*(?:(?:around|about|approximately|nearly|over)\s+)?$",
@@ -1147,7 +1180,7 @@ def send_text(text):
 
 def empty_scan_state():
     return {"version": 1, "pending": {}, "completed": {}, "deliveries": [], "event_matches": [],
-            "source_cursor": "", "delivery_cursor": "", "last_cycle": {}}
+            "source_cursor": "", "delivery_cursor": "", "last_cycle": {}, "feed_health": {}}
 
 
 def load_scan_state():
@@ -1160,8 +1193,9 @@ def load_scan_state():
         raise ValueError("Unsupported or damaged scan state; queue was left untouched")
     state.setdefault("delivery_cursor", "")
     state.setdefault("event_matches", [])
+    state.setdefault("feed_health", {})
     for key, kind in (("pending", dict), ("completed", dict), ("deliveries", list), ("event_matches", list),
-                      ("source_cursor", str), ("delivery_cursor", str), ("last_cycle", dict)):
+                      ("source_cursor", str), ("delivery_cursor", str), ("last_cycle", dict), ("feed_health", dict)):
         if not isinstance(state.get(key), kind):
             raise ValueError("Damaged scan state: " + key)
     for key, item in state["pending"].items():
@@ -1180,6 +1214,18 @@ def load_scan_state():
             raise ValueError("Damaged queue completion history")
     if any(not isinstance(record, dict) for record in state["deliveries"] + state["event_matches"]):
         raise ValueError("Damaged queue delivery history")
+    for url, health in state["feed_health"].items():
+        if (not isinstance(url, str) or not isinstance(health, dict)
+                or type(health.get("consecutive_failures")) is not int
+                or health["consecutive_failures"] < 0
+                or type(health.get("incident_open")) is not bool
+                or not isinstance(health.get("last_error"), str)
+                or type(health.get("entry_count")) is not int):
+            raise ValueError("Damaged feed health history")
+        for field in ("last_checked", "last_success", "failure_since", "notified_at", "next_notification_after", "newest_article"):
+            value = health.get(field)
+            if value is not None and (type(value) not in (int, float) or not 0 <= value < 1e12):
+                raise ValueError("Damaged feed health timestamp")
     return state
 
 
@@ -1200,6 +1246,138 @@ def save_scan_state(state):
     finally:
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
+
+
+def feed_label(url):
+    """Keep source names useful even for several feeds from the same publisher."""
+    label = globals().get("FEED_LABELS", {}).get(url)
+    if label:
+        return label
+    parsed = urlsplit(url)
+    if parsed.hostname == "news.google.com":
+        query = dict(parse_qsl(parsed.query)).get("q", "")
+        return "Google News: " + query[:100]
+    return ((parsed.hostname or "Feed").removeprefix("www.") + parsed.path.rstrip("/"))[:120]
+
+
+def record_feed_health(state, url, ok, error="", entry_count=0, now=None, newest_article=None):
+    now = time.time() if now is None else now
+    health = state.setdefault("feed_health", {}).setdefault(url, {
+        "last_checked": None, "last_success": None, "failure_since": None,
+        "consecutive_failures": 0, "last_error": "", "entry_count": 0,
+        "incident_open": False, "notified_at": None, "next_notification_after": None,
+        "newest_article": None,
+    })
+    health["last_checked"] = now
+    health["entry_count"] = entry_count if ok else 0
+    if ok:
+        health.update(last_success=now, consecutive_failures=0, failure_since=None,
+                      last_error="", newest_article=newest_article)
+        if not health["incident_open"]:
+            health["next_notification_after"] = None
+    else:
+        if not health["consecutive_failures"]:
+            health["failure_since"] = now
+        health["consecutive_failures"] += 1
+        health["last_error"] = str(error)[:160]
+    return health
+
+
+def feed_health_timestamp(value):
+    if value is None:
+        return "not yet recorded"
+    return datetime.fromtimestamp(value, timezone.utc).astimezone(IST).strftime("%d %b, %H:%M IST")
+
+
+def send_feed_health_message(message):
+    """Confirm the warning was accepted; never log a token-bearing exception URL."""
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML",
+                  "link_preview_options": {"is_disabled": True}}, timeout=10)
+        response.raise_for_status()
+        return response.json().get("ok") is True
+    except Exception as error:
+        print("Feed health notification not confirmed: " + type(error).__name__)
+        return False
+
+
+def notify_feed_health(state, now=None):
+    """One grouped message: persistent outage, daily reminder, or confirmed recovery."""
+    now = time.time() if now is None else now
+    notifications = []
+    header = "🩺 <b>News feed health</b>\n"
+    footer = "\n\nChecks continue automatically. Use /feeds for source details."
+    message = header
+    for url in FEEDS:
+        health = state.get("feed_health", {}).get(url)
+        if not health or (health["next_notification_after"] is not None and health["next_notification_after"] > now):
+            continue
+        failures = health["consecutive_failures"]
+        if failures:
+            if failures < FEED_FAILURE_CHECKS or now - health["failure_since"] < FEED_FAILURE_GRACE:
+                continue
+            if health["incident_open"] and now - health["notified_at"] < FEED_HEALTH_REMINDER:
+                continue
+            label = "Still unavailable" if health["incident_open"] else "Needs attention"
+            line = (f"\n⚠️ <b>{html.escape(feed_label(url))}</b> — {label}\n"
+                    f"{failures} failed checks; {html.escape(health['last_error'])}. "
+                    f"Last successful read: {feed_health_timestamp(health['last_success'])}.")
+            kind = "failure"
+        elif health["incident_open"]:
+            line = f"\n✅ <b>{html.escape(feed_label(url))}</b> — Reading articles again."
+            line = f"\n✅ <b>{html.escape(feed_label(url))}</b> — Feed is readable again."
+            kind = "recovery"
+        else:
+            continue
+        if len(notifications) >= 10 or len(message + line + footer) > 3500:
+            break
+        message += line + "\n"
+        notifications.append((url, kind))
+    if not notifications:
+        return False
+    # Persist the retry cooldown BEFORE sending: a rapid /latest or restart must
+    # not flood the group if Telegram cannot confirm receipt. Keep incidents open.
+    for url, _ in notifications:
+        state["feed_health"][url]["next_notification_after"] = now + POLL_INTERVAL
+    save_scan_state(state)
+    if not send_feed_health_message(message + footer):
+        return False
+    for url, kind in notifications:
+        health = state["feed_health"][url]
+        health["incident_open"] = kind == "failure"
+        health["notified_at"] = now if kind == "failure" else None
+        health["next_notification_after"] = None
+    save_scan_state(state)
+    return True
+
+
+def feed_health_text(state):
+    """Detailed source report. cmd_feeds splits at paragraph boundaries."""
+    parts = ["🩺 <b>News feed health</b>\nAutomatic warning after 3 failed checks spanning at least 20 minutes. "
+             "One reminder per day while unavailable; a message on recovery.\n"
+             "Checks and health warnings continue when funding alerts are muted."]
+    for url in FEEDS:
+        health = state.get("feed_health", {}).get(url)
+        title = f"<b>{html.escape(feed_label(url))}</b>"
+        if not health:
+            parts.append(title + "\nNot checked with this version yet.")
+            continue
+        if health["consecutive_failures"]:
+            detail = (f"⚠️ {health['consecutive_failures']} consecutive failed checks: "
+                      f"{html.escape(health['last_error'])}")
+        else:
+            detail = f"✅ Read successfully; {health['entry_count']} entries available."
+        detail += (f"\nLast check: {feed_health_timestamp(health['last_checked'])}"
+                   f"\nLast successful read: {feed_health_timestamp(health['last_success'])}")
+        if health.get("newest_article") is not None:
+            detail += f"\nNewest dated article: {feed_health_timestamp(health['newest_article'])}"
+        detail += f'\n<a href="{html.escape(url, quote=True)}">Feed address</a>'
+        if urlsplit(url).hostname == "news.google.com":
+            detail += "\nVia Google News; delivery depends on its indexing."
+        parts.append(title + "\n" + detail)
+    return "\n\n".join(parts)
 
 
 def queue_article_key(article, source):
@@ -1274,18 +1452,27 @@ def collect_feed_articles(state, archive, seen, sent_titles, stats, now, new_see
     deliveries = event_history(state, archive)
     for feed_url in FEEDS:
         stats["feeds_attempted"] += 1
+        response = None
         try:
-            response = requests.get(feed_url, timeout=(5, 15))
+            response = requests.get(feed_url, timeout=(5, 15), headers=FEED_HTTP_HEADERS)
             response.raise_for_status()
             headers = {key.lower(): value for key, value in response.headers.items()}
             headers["content-location"] = urljoin(response.url, headers.get("content-location", ""))
             feed = feedparser.parse(response.content, response_headers=headers)
-            if not feed.get("version") or not feed.entries:
-                raise ValueError("Feed is empty or is not RSS/Atom")
+            if not feed.get("version") or (feed.get("bozo") and not feed.entries):
+                raise ValueError("Response is not readable RSS/Atom")
             stats["feeds_ok"] += 1
+            dates = [get_published_date(entry) for entry in feed.entries[:MAX_FEED_ENTRIES]]
+            newest = max((date.timestamp() for date in dates if date is not None), default=None)
+            record_feed_health(state, feed_url, True, entry_count=len(feed.entries), newest_article=newest)
         except Exception as error:
             stats["feed_errors"].append(feed_url)
-            print(f"Feed unavailable ({feed_url[:70]}): {type(error).__name__}")
+            status = getattr(response, "status_code", None)
+            reason = f"HTTP {status}" if isinstance(status, int) and status >= 400 else type(error).__name__
+            if isinstance(error, ValueError):
+                reason = "Response is not readable RSS/Atom"
+            record_feed_health(state, feed_url, False, error=reason)
+            print(f"Feed unavailable ({feed_url[:70]}): {reason}")
             continue
 
         for entry in feed.entries[:MAX_FEED_ENTRIES]:
@@ -1452,6 +1639,7 @@ def fetch_and_alert(seen, sent_titles, max_alerts=MAX_AUTO_ALERTS, sector_filter
     collect_feed_articles(state, archive, seen, sent_titles, stats, now, new_seen)
     state["last_cycle"] = stats
     save_scan_state(state)  # Must succeed before any paid checks or Telegram sends.
+    notify_feed_health(state)
     save_json(ARCHIVE_FILE, archive, limit=5000)
     new_sent = process_scan_queue(state, archive, sent_titles, max_alerts, sector_filter, stats, time.time(), new_seen) if process_pending else []
     stats["pending"] = len(state["pending"])
@@ -1880,7 +2068,7 @@ def scan_status_text():
         started = datetime.fromisoformat(stats["started_at"]).astimezone(IST).strftime("%d %b, %H:%M IST")
         text += (f"\n\n🔎 <b>Last cycle</b> — {started}\n"
                  f"Feeds read: {stats.get('feeds_ok', 0)}/{stats.get('feeds_attempted', 0)}\n"
-                 f"Feeds unavailable/empty: {len(stats.get('feed_errors', []))}\n"
+                 f"Feeds unavailable/invalid: {len(stats.get('feed_errors', []))}\n"
                  f"Article entries scanned: {stats.get('articles_scanned', 0)}\n"
                  f"New articles queued: {stats.get('queued_new', 0)}\n"
                  f"Relevance checks: {stats.get('relevance_checks', 0)}/{MAX_RELEVANCE_CHECKS}\n"
@@ -1929,6 +2117,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick health check — kept for backward compatibility."""
     await cmd_settings(update, context)
 
+async def cmd_feeds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        state = await asyncio.to_thread(load_scan_state)
+        report = feed_health_text(state)
+    except Exception:
+        await update.message.reply_text("Saved feed health is unavailable. Check Railway logs before resetting anything.")
+        return
+    chunk = ""
+    for paragraph in report.split("\n\n"):
+        if chunk and len(chunk) + len(paragraph) + 2 > 3500:
+            await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+            chunk = ""
+        chunk += ("\n\n" if chunk else "") + paragraph
+    if chunk:
+        await update.message.reply_text(chunk, parse_mode="HTML", disable_web_page_preview=True)
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 <b>Available Commands</b>\n\n"
@@ -1949,6 +2153,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/feedback <i>message</i> — send general feedback\n\n"
         "<b>Info</b>\n"
         "/settings — current config and stats\n"
+        "/feeds — source health, errors and last successful reads\n"
         "/reset — clear all data and start fresh\n"
         "/help — this menu\n\n"
         "<i>Auto-alerts run every 10 minutes when unmuted. "
@@ -2034,6 +2239,7 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("feeds", cmd_feeds))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CallbackQueryHandler(handle_rejection_callback, pattern="^reject:"))
 
